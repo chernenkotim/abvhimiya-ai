@@ -99,7 +99,7 @@ async def chat_endpoint(req: ChatRequest):
     full_prompt = f"{catalog_context}\n{history_text}Поточне запитання покупця: {user_query}"
 
     # 3. Виклик Gemini з чергою стабільних моделей (Fallback)
-    candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
+    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
     response = None
     last_error = None
 
