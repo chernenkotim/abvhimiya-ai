@@ -82,14 +82,31 @@ async def chat_endpoint(req: ChatRequest):
     prompt = f"{catalog_context}\nЗапитання покупця: {user_query}"
 
     try:
+        # Список стабільних моделей у порядку пріоритету
+candidate_models = ["gemini-2.0-flash", "gemini-1.5-flash"]
+response = None
+last_error = None
+
+for model_name in candidate_models:
+    try:
         response = client.models.generate_content(
-            model="gemini-3.8-flash",
+            model=model_name,
             contents=prompt,
             config=types.GenerateContentConfig(
                 system_instruction=SYSTEM_INSTRUCTION,
                 temperature=0.2,
             )
         )
+        if response and response.text:
+            break
+    except Exception as err:
+        last_error = err
+        continue
+
+if response and response.text:
+    return ChatResponse(reply=response.text)
+else:
+    return ChatResponse(reply=f"Виникла помилка: {str(last_error)}")
         return ChatResponse(reply=response.text)
     except Exception as e:
         return ChatResponse(reply=f"Виникла помилка: {str(e)}")
