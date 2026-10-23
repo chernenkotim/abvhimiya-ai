@@ -70,14 +70,13 @@ async def chat_endpoint(req: ChatRequest):
 
     # 1. Пошук товарів у каталозі за запитом
     relevant_items = catalog.search_relevant_products(user_query, limit=5)
-    
     catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ ХОРОШОП:\n"
     if relevant_items:
         for idx, item in enumerate(relevant_items, 1):
             avail_str = "В наявності" if item["available"] else "Під замовлення / Немає"
             catalog_context += (
                 f"{idx}. {item['name']}\n"
-                f"   Ціна: {item['price']} {item['currency']}\n"
+                f"   Ціна: {item['price']}\n"
                 f"   Статус: {avail_str}\n"
                 f"   Картка: {item['url']}\n"
                 f"   Параметри: {item['params']}\n"
