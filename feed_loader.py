@@ -9,43 +9,41 @@ load_dotenv()
 
 HOROSHOP_FEED_URL = os.getenv("HOROSHOP_FEED_URL", "")
 
-# Словник транскодування випадкової англійської розкладки в кирилицю
 EN_TO_UA_KEYBOARD = str.maketrans(
     "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~",
     "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
 )
 
-# Словник професійних синонімів будівельної хімії та 3D-друку
-SYNONYMS_MAP = {
-    "клей": ["glue", "adhesive", "kleber", "bond", "епоксидний", "epoxy"],
-    "клею": ["glue", "adhesive", "клей"],
-    "епоксидний": ["epoxy", "епоксид", "епоксидна", "епоксидка"],
-    "епоксидка": ["epoxy", "епоксидний", "епоксидна"],
-    "герметик": ["sealant", "silicone", "силікон", "акрил", "силіконовий"],
-    "силікон": ["silicone", "герметик", "sealant"],
-    "грунтовка": ["primer", "грунт", "ґрунтовка", "ґрунт"],
-    "ґрунтовка": ["primer", "грунт", "грунтовка"],
-    "фарба": ["paint", "емаль", "color", "краска"],
-    "піна": ["foam", "монтажна піна"],
-    "філамент": ["filament", "пластик", "pla", "petg", "abs"],
-    "пластик": ["filament", "pla", "petg", "abs", "філамент"],
-    "гідроізоляція": ["waterproof", "waterproofing", "гідробар'єр"],
-    "очисник": ["cleaner", "змивка", "розчинник", "solvent"],
-    "розчинник": ["solvent", "thinner", "розріджувач"]
-}
+# Двосторонній розширений словник термінів будівельної хімії та 3D
+BASE_SYNONYMS = [
+    {"клей", "glue", "adhesive", "kleber", "епоксид", "епоксидний", "epoxy"},
+    {"герметик", "sealant", "silicone", "силікон", "акрил", "силіконовий"},
+    {"грунтовка", "грунт", "ґрунтовка", "ґрунт", "primer"},
+    {"фарба", "paint", "емаль", "колор", "краска"},
+    {"піна", "foam", "монтажна піна"},
+    {"філамент", "filament", "пластик", "pla", "petg", "abs"},
+    {"гідроізоляція", "waterproof", "waterproofing", "гідробар'єр"},
+    {"очисник", "cleaner", "змивка", "розчинник", "solvent", "thinner"}
+]
+
+SYNONYMS_INDEX = {}
+for group in BASE_SYNONYMS:
+    for word in group:
+        SYNONYMS_INDEX[word] = group
 
 def fix_keyboard_layout(text: str) -> str:
-    """Виправляє текст, набраний помилково латинськими літерами замість кирилиці."""
-    converted = text.translate(EN_TO_UA_KEYBOARD)
-    # Якщо перетворений текст містить типові кириличні літери
-    if re.search(r"[а-яіїєґ]", converted, re.IGNORECASE):
-        return converted
+    """Конвертує текст тільки тоді, коли в ньому є явні ознаки помилкової англійської розкладки"""
+    # Якщо рядок суто латинський, але це не відомий бренд, пробуємо конвертувати
+    if re.fullmatch(r"[a-zA-Z0-9\s\.,'ʼ\-\/]+", text):
+        converted = text.translate(EN_TO_UA_KEYBOARD)
+        # Перевіряємо, чи отримали реальні українські літери
+        if re.search(r"[а-яіїєґ]{3,}", converted, re.IGNORECASE):
+            return converted
     return text
 
 def normalize_stem(word: str) -> str:
-    """Відрізає поширені українські закінчення для м'якого збігу слів."""
     w = word.lower().strip()
-    endings = ["ного", "ному", "ним", "ний", "на", "не", "ні", "ою", "ям", "ем", "ом", "ий", "их", "им", "ів", "а", "е", "у", "і", "и"]
+    endings = ["ного", "ному", "ним", "ний", "ою", "ям", "ем", "ом", "ий", "их", "им", "ів", "на", "не", "ні", "а", "е", "у", "і", "и"]
     for end in sorted(endings, key=len, reverse=True):
         if len(w) > len(end) + 3 and w.endswith(end):
             return w[:-len(end)]
@@ -62,10 +60,10 @@ class CatalogManager:
             print("ПОМИЛКА: Не вказано HOROSHOP_FEED_URL")
             return
 
-        print(f"Завантаження фіда з Хорошоп: {self.feed_url}")
+        print(f"Завантаження та індексація каталогу: {self.feed_url}")
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True, headers=headers) as client:
+            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, headers=headers) as client:
                 response = await client.get(self.feed_url)
                 response.raise_for_status()
                 xml_content = response.content
@@ -73,10 +71,10 @@ class CatalogManager:
             soup = BeautifulSoup(xml_content, "xml")
             parsed_items = []
 
-            # 1. Розбір формату Rozetka / Prom / YML (<offer>)
+            # 1. Формат Rozetka / Prom / YML
             offers = soup.find_all("offer")
             if offers:
-                print(f"Виявлено формат Rozetka/YML. Знайдено товарів: {len(offers)}")
+                print(f"Формат Rozetka/YML. Знайдено карток: {len(offers)}")
                 for offer in offers:
                     offer_id = (offer.get("id") or "").strip()
                     available = offer.get("available", "false").lower() == "true"
@@ -102,6 +100,9 @@ class CatalogManager:
                         desc_soup = BeautifulSoup(desc_elem.text, "html.parser")
                         desc_text = desc_soup.get_text(separator=" ").strip()
 
+                    category_elem = offer.find("categoryId")
+                    category = category_elem.text.strip() if category_elem else ""
+
                     params = []
                     for p in offer.find_all("param"):
                         p_name = (p.get("name") or "").strip()
@@ -110,22 +111,27 @@ class CatalogManager:
                             params.append(f"{p_name}: {p_val}")
 
                     codes = f"{offer_id} {vendor_code}".strip()
+                    full_text = f"{codes} {name} {category} {desc_text} {' '.join(params)}".lower()
+
                     parsed_items.append({
                         "id": offer_id,
                         "vendor_code": vendor_code,
                         "name": name,
                         "price": f"{price} {currency}".strip(),
+                        "currency": currency,
                         "available": available,
                         "url": url,
                         "params": "; ".join(params),
                         "description": desc_text[:450],
-                        "search_text": f"{codes} {name} {desc_text} {' '.join(params)}".lower()
+                        "search_text": full_text,
+                        "name_lower": name.lower(),
+                        "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
 
-            # 2. Розбір формату Google Merchant (<item>)
+            # 2. Формат Google Feed
             else:
                 items = soup.find_all("item")
-                print(f"Виявлено формат Google Feed. Знайдено товарів: {len(items)}")
+                print(f"Формат Google Feed. Знайдено карток: {len(items)}")
                 for item in items:
                     g_id = item.find(["g:id", "id"])
                     offer_id = g_id.text.strip() if g_id else ""
@@ -153,85 +159,91 @@ class CatalogManager:
                     vendor_code = mpn_elem.text.strip() if mpn_elem else offer_id
 
                     codes = f"{offer_id} {vendor_code}".strip()
+                    full_text = f"{codes} {name} {desc_text}".lower()
+
                     parsed_items.append({
                         "id": offer_id,
                         "vendor_code": vendor_code,
                         "name": name,
                         "price": price,
+                        "currency": "UAH",
                         "available": available,
                         "url": url,
                         "params": "",
                         "description": desc_text[:450],
-                        "search_text": f"{codes} {name} {desc_text}".lower()
+                        "search_text": full_text,
+                        "name_lower": name.lower(),
+                        "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
 
             self.products = parsed_items
             self.last_updated = time.time()
-            print(f"Каталог успішно оновлено! Завантажено товарів: {len(self.products)}")
+            print(f"Індексацію завершено. Готово до продажу товарів: {len(self.products)}")
         except Exception as e:
             print(f"Помилка при завантаженні фіда: {e}")
 
-    def search_relevant_products(self, query: str, limit: int = 10) -> list:
+    def search_relevant_products(self, query: str, limit: int = 8) -> list:
         if not self.products:
             return []
 
-        # Виправлення можливої розкладки клавіатури
-        clean_query = query.strip().lower()
-        fixed_query = fix_keyboard_layout(clean_query)
-        
-        # Об'єднуємо обидва варіанти для надійності
-        search_sources = set(clean_query.split() + fixed_query.split())
-        query_tokens = [w.strip() for w in search_sources if len(w.strip()) >= 2]
+        raw_query = query.strip().lower()
+        fixed_layout = fix_keyboard_layout(raw_query)
+
+        # Витягуємо чисті токени
+        tokens = set(re.findall(r"[\w\d]+", raw_query))
+        if fixed_layout != raw_query:
+            tokens.update(re.findall(r"[\w\d]+", fixed_layout))
+
+        query_tokens = [t for t in tokens if len(t) >= 2]
         if not query_tokens:
             return self.products[:limit]
 
-        # 1. Прямий пошук за артикулом або ID
-        exact_code_matches = []
+        # 1. Пріоритет: точний збіг за артикулом або ID
+        exact_matches = []
         for p in self.products:
             p_id = p["id"].lower()
             p_code = p["vendor_code"].lower()
             for token in query_tokens:
                 if (p_id and token == p_id) or (p_code and token == p_code):
-                    exact_code_matches.append(p)
+                    exact_matches.append(p)
                     break
-        if exact_code_matches:
-            return exact_code_matches[:limit]
+        if exact_matches:
+            return exact_matches[:limit]
 
-        # 2. Розширення пошукових токенів через синоніми та основи слів
-        expanded_search_terms = set()
-        for token in query_tokens:
-            expanded_search_terms.add(token)
-            expanded_search_terms.add(normalize_stem(token))
-            
-            # Додаємо синоніми (наприклад: клей -> epoxy, glue, adhesive)
-            for key, synonyms in SYNONYMS_MAP.items():
-                if key in token or token in key:
-                    expanded_search_terms.update(synonyms)
+        # 2. Розширення токенів синонімами та основами слів
+        expanded_terms = set()
+        for t in query_tokens:
+            expanded_terms.add(t)
+            expanded_terms.add(normalize_stem(t))
+            if t in SYNONYMS_INDEX:
+                expanded_terms.update(SYNONYMS_INDEX[t])
 
-        # 3. Скоринг релевантності товарів
-        scored_products = []
+        # 3. Швидкий скоринг через множини токенів
+        scored = []
         for p in self.products:
             score = 0
-            p_name_lower = p["name"].lower()
-            search_blob = p["search_text"]
+            p_name = p["name_lower"]
+            p_tokens = p["tokens"]
 
-            for term in expanded_search_terms:
+            for term in expanded_terms:
                 if len(term) < 2:
                     continue
-                # Збіг у назві має найвищу вагу
-                if term in p_name_lower:
-                    score += 8
-                # Збіг у характеристиках / описі
-                elif term in search_blob:
-                    score += 2
+                # Точний збіг слова в назві
+                if term in p_name:
+                    score += 10
+                # Збіг серед токенів опису / параметрів
+                elif term in p_tokens:
+                    score += 3
 
-            # Додатковий бонус товарам у наявності
             if score > 0:
+                # Комерційний множник: товари в наявності завжди вище
                 if p["available"]:
-                    score += 1
-                scored_products.append((score, p))
+                    score += 5
+                else:
+                    score -= 2
+                scored.append((score, p))
 
-        scored_products.sort(key=lambda x: x[0], reverse=True)
-        return [item[1] for item in scored_products[:limit]]
+        scored.sort(key=lambda x: x[0], reverse=True)
+        return [item[1] for item in scored[:limit]]
 
 catalog = CatalogManager(HOROSHOP_FEED_URL)
