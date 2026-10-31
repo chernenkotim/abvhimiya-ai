@@ -14,12 +14,13 @@ EN_TO_UA_KEYBOARD = str.maketrans(
     "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
 )
 
-# Двосторонній індекс термінів будівельної хімії та 3D-друку
+# Двосторонній індекс синонімів із врахуванням ванн, сантехніки та реставрації
 BASE_SYNONYMS = [
+    {"ванна", "ванни", "ванн", "вани", "кераміка", "ceramic", "сантехніка", "реставрація"},
     {"клей", "glue", "adhesive", "kleber", "епоксид", "епоксидний", "epoxy"},
     {"герметик", "sealant", "silicone", "силікон", "акрил", "силіконовий"},
     {"грунтовка", "грунт", "ґрунтовка", "ґрунт", "primer"},
-    {"фарба", "paint", "емаль", "колор", "краска"},
+    {"фарба", "paint", "емаль", "колор", "краска", "аерозоль", "балончик"},
     {"піна", "foam", "монтажна піна"},
     {"філамент", "filament", "пластик", "pla", "petg", "abs"},
     {"гідроізоляція", "waterproof", "waterproofing", "гідробар'єр"},
@@ -34,14 +35,12 @@ for group in BASE_SYNONYMS:
 HTML_TAG_CLEANER = re.compile(r"<[^>]+>")
 
 def clean_html(raw_html: str) -> str:
-    """Швидке очищення опису від HTML-тегів без виклику важкого парсера"""
     if not raw_html:
         return ""
     text = HTML_TAG_CLEANER.sub(" ", raw_html)
     return " ".join(text.split())
 
 def fix_keyboard_layout(text: str) -> str:
-    """Виправляє запити, помилково набрані в англійській розкладці"""
     if re.fullmatch(r"[a-zA-Z0-9\s\.,'ʼ\-\/]+", text):
         converted = text.translate(EN_TO_UA_KEYBOARD)
         if re.search(r"[а-яіїєґ]{3,}", converted, re.IGNORECASE):
@@ -50,9 +49,11 @@ def fix_keyboard_layout(text: str) -> str:
 
 def normalize_stem(word: str) -> str:
     w = word.lower().strip()
+    # Прибираємо випадкові подвоєння приголосних (ванна -> вана, ванни -> вани)
+    w = re.sub(r'(.)\1+', r'\1', w)
     endings = ["ного", "ному", "ним", "ний", "ою", "ям", "ем", "ом", "ий", "их", "им", "ів", "на", "не", "ні", "а", "е", "у", "і", "и"]
     for end in sorted(endings, key=len, reverse=True):
-        if len(w) > len(end) + 3 and w.endswith(end):
+        if len(w) > len(end) + 2 and w.endswith(end):
             return w[:-len(end)]
     return w
 
@@ -67,7 +68,6 @@ class CatalogManager:
             print("ПОМИЛКА: Не вказано HOROSHOP_FEED_URL")
             return
 
-        # Додаємо мітку часу для обходу статичного кешування провайдерами
         separator = "&" if "?" in self.feed_url else "?"
         fresh_url = f"{self.feed_url}{separator}_t={int(time.time())}"
 
@@ -82,7 +82,6 @@ class CatalogManager:
             soup = BeautifulSoup(xml_content, "xml")
             parsed_items = []
 
-            # 1. Формат Rozetka / Prom / YML (<offer>)
             offers = soup.find_all("offer")
             if offers:
                 print(f"Формат Rozetka/YML. Знайдено карток: {len(offers)}")
@@ -129,13 +128,12 @@ class CatalogManager:
                         "currency": currency,
                         "available": available,
                         "url": url,
-                        "params": "; ".join(params[:5]),  # Тільки перші 5 найважливіших параметрів
-                        "description": desc_text[:180],     # Оптимальна довжина опису для AI
+                        "params": "; ".join(params[:5]),
+                        "description": desc_text[:200],
                         "name_lower": name.lower(),
+                        "search_blob": full_text,
                         "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
-
-            # 2. Формат Google Feed (<item>)
             else:
                 items = soup.find_all("item")
                 print(f"Формат Google Feed. Знайдено карток: {len(items)}")
@@ -174,8 +172,9 @@ class CatalogManager:
                         "available": available,
                         "url": url,
                         "params": "",
-                        "description": desc_text[:180],
+                        "description": desc_text[:200],
                         "name_lower": name.lower(),
+                        "search_blob": full_text,
                         "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
 
@@ -185,7 +184,7 @@ class CatalogManager:
         except Exception as e:
             print(f"Помилка при завантаженні фіда: {e}")
 
-    def search_relevant_products(self, query: str, limit: int = 5) -> list:
+    def search_relevant_products(self, query: str, limit: int = 6) -> list:
         if not self.products:
             return []
 
@@ -200,7 +199,7 @@ class CatalogManager:
         if not query_tokens:
             return self.products[:limit]
 
-        # 1. Пріоритет: точний збіг за артикулом або ID
+        # 1. Точний пошук за кодом або артикулом
         exact_matches = []
         for p in self.products:
             p_id = p["id"].lower()
@@ -212,34 +211,45 @@ class CatalogManager:
         if exact_matches:
             return exact_matches[:limit]
 
-        # 2. Розширення токенів синонімами та основами слів
+        # 2. Розширення токенів основами, синонімами та зняттям подвоєнь
         expanded_terms = set()
         for t in query_tokens:
             expanded_terms.add(t)
-            expanded_terms.add(normalize_stem(t))
+            stem = normalize_stem(t)
+            expanded_terms.add(stem)
+            
+            # Якщо є в індексі синонімів
             if t in SYNONYMS_INDEX:
                 expanded_terms.update(SYNONYMS_INDEX[t])
+            if stem in SYNONYMS_INDEX:
+                expanded_terms.update(SYNONYMS_INDEX[stem])
 
-        # 3. Швидкий скоринг через множини токенів
+        # 3. Скоринг релевантності
         scored = []
         for p in self.products:
             score = 0
             p_name = p["name_lower"]
             p_tokens = p["tokens"]
+            p_blob = p["search_blob"]
 
             for term in expanded_terms:
                 if len(term) < 2:
                     continue
+                # Точний або частковий збіг у назві
                 if term in p_name:
-                    score += 10
+                    score += 12
+                # Збіг у токенах характеристик/опису
                 elif term in p_tokens:
-                    score += 3
+                    score += 4
+                # М'який підрядок у повному блобі
+                elif term in p_blob:
+                    score += 2
 
             if score > 0:
                 if p["available"]:
                     score += 5
                 else:
-                    score -= 2
+                    score -= 3
                 scored.append((score, p))
 
         scored.sort(key=lambda x: x[0], reverse=True)
