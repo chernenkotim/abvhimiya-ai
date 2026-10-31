@@ -14,7 +14,7 @@ EN_TO_UA_KEYBOARD = str.maketrans(
     "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
 )
 
-# Двосторонній розширений словник термінів будівельної хімії та 3D
+# Двосторонній індекс термінів будівельної хімії та 3D-друку
 BASE_SYNONYMS = [
     {"клей", "glue", "adhesive", "kleber", "епоксид", "епоксидний", "epoxy"},
     {"герметик", "sealant", "silicone", "силікон", "акрил", "силіконовий"},
@@ -31,12 +31,19 @@ for group in BASE_SYNONYMS:
     for word in group:
         SYNONYMS_INDEX[word] = group
 
+HTML_TAG_CLEANER = re.compile(r"<[^>]+>")
+
+def clean_html(raw_html: str) -> str:
+    """Швидке очищення опису від HTML-тегів без виклику важкого парсера"""
+    if not raw_html:
+        return ""
+    text = HTML_TAG_CLEANER.sub(" ", raw_html)
+    return " ".join(text.split())
+
 def fix_keyboard_layout(text: str) -> str:
-    """Конвертує текст тільки тоді, коли в ньому є явні ознаки помилкової англійської розкладки"""
-    # Якщо рядок суто латинський, але це не відомий бренд, пробуємо конвертувати
+    """Виправляє запити, помилково набрані в англійській розкладці"""
     if re.fullmatch(r"[a-zA-Z0-9\s\.,'ʼ\-\/]+", text):
         converted = text.translate(EN_TO_UA_KEYBOARD)
-        # Перевіряємо, чи отримали реальні українські літери
         if re.search(r"[а-яіїєґ]{3,}", converted, re.IGNORECASE):
             return converted
     return text
@@ -60,18 +67,22 @@ class CatalogManager:
             print("ПОМИЛКА: Не вказано HOROSHOP_FEED_URL")
             return
 
-        print(f"Завантаження та індексація каталогу: {self.feed_url}")
+        # Додаємо мітку часу для обходу статичного кешування провайдерами
+        separator = "&" if "?" in self.feed_url else "?"
+        fresh_url = f"{self.feed_url}{separator}_t={int(time.time())}"
+
+        print(f"Завантаження та швидка індексація каталогу: {self.feed_url}")
         try:
             headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            async with httpx.AsyncClient(timeout=120.0, follow_redirects=True, headers=headers) as client:
-                response = await client.get(self.feed_url)
+            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True, headers=headers) as client:
+                response = await client.get(fresh_url)
                 response.raise_for_status()
                 xml_content = response.content
 
             soup = BeautifulSoup(xml_content, "xml")
             parsed_items = []
 
-            # 1. Формат Rozetka / Prom / YML
+            # 1. Формат Rozetka / Prom / YML (<offer>)
             offers = soup.find_all("offer")
             if offers:
                 print(f"Формат Rozetka/YML. Знайдено карток: {len(offers)}")
@@ -95,10 +106,7 @@ class CatalogManager:
                     url = url_elem.text.strip() if url_elem else ""
 
                     desc_elem = offer.find("description")
-                    desc_text = ""
-                    if desc_elem:
-                        desc_soup = BeautifulSoup(desc_elem.text, "html.parser")
-                        desc_text = desc_soup.get_text(separator=" ").strip()
+                    desc_text = clean_html(desc_elem.text) if desc_elem else ""
 
                     category_elem = offer.find("categoryId")
                     category = category_elem.text.strip() if category_elem else ""
@@ -121,14 +129,13 @@ class CatalogManager:
                         "currency": currency,
                         "available": available,
                         "url": url,
-                        "params": "; ".join(params),
-                        "description": desc_text[:450],
-                        "search_text": full_text,
+                        "params": "; ".join(params[:5]),  # Тільки перші 5 найважливіших параметрів
+                        "description": desc_text[:180],     # Оптимальна довжина опису для AI
                         "name_lower": name.lower(),
                         "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
 
-            # 2. Формат Google Feed
+            # 2. Формат Google Feed (<item>)
             else:
                 items = soup.find_all("item")
                 print(f"Формат Google Feed. Знайдено карток: {len(items)}")
@@ -146,10 +153,7 @@ class CatalogManager:
                     url = link_elem.text.strip() if link_elem else ""
 
                     desc_elem = item.find(["g:description", "description"])
-                    desc_text = ""
-                    if desc_elem:
-                        desc_soup = BeautifulSoup(desc_elem.text, "html.parser")
-                        desc_text = desc_soup.get_text(separator=" ").strip()
+                    desc_text = clean_html(desc_elem.text) if desc_elem else ""
 
                     avail_elem = item.find(["g:availability", "availability"])
                     avail_str = avail_elem.text.strip().lower() if avail_elem else ""
@@ -170,8 +174,7 @@ class CatalogManager:
                         "available": available,
                         "url": url,
                         "params": "",
-                        "description": desc_text[:450],
-                        "search_text": full_text,
+                        "description": desc_text[:180],
                         "name_lower": name.lower(),
                         "tokens": set(re.findall(r"[\w\d]+", full_text))
                     })
@@ -182,14 +185,13 @@ class CatalogManager:
         except Exception as e:
             print(f"Помилка при завантаженні фіда: {e}")
 
-    def search_relevant_products(self, query: str, limit: int = 8) -> list:
+    def search_relevant_products(self, query: str, limit: int = 5) -> list:
         if not self.products:
             return []
 
         raw_query = query.strip().lower()
         fixed_layout = fix_keyboard_layout(raw_query)
 
-        # Витягуємо чисті токени
         tokens = set(re.findall(r"[\w\d]+", raw_query))
         if fixed_layout != raw_query:
             tokens.update(re.findall(r"[\w\d]+", fixed_layout))
@@ -228,15 +230,12 @@ class CatalogManager:
             for term in expanded_terms:
                 if len(term) < 2:
                     continue
-                # Точний збіг слова в назві
                 if term in p_name:
                     score += 10
-                # Збіг серед токенів опису / параметрів
                 elif term in p_tokens:
                     score += 3
 
             if score > 0:
-                # Комерційний множник: товари в наявності завжди вище
                 if p["available"]:
                     score += 5
                 else:
