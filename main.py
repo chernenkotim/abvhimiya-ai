@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
@@ -27,15 +27,17 @@ ADMIN_SECRET = os.getenv("ADMIN_SECRET", "abv2026")
 PHONE_REGEX = re.compile(r"(?:\+?38\s*)?(?:\(0\d{2}\)|0\d{2})[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}")
 
 SESSION_CACHE: Dict[str, dict] = {}
+RATE_LIMIT_CACHE: Dict[str, list] = {}  # session_id -> list of timestamps
+MAX_REQUESTS_PER_MINUTE = 20
+
 MAX_HISTORY_TURNS = 8
 SESSION_TTL_SECONDS = 14400
 
-# Буфер історії повідомлень для перегляду у веб-панелі (останні 150 подій)
 RECENT_LOGS: List[dict] = []
 MAX_SAVED_LOGS = 150
 
 async def send_telegram_alert(text: str):
-    """Відправка реплік або замовлень у Telegram"""
+    """Безпечна відправка сповіщень або замовлень у Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -61,15 +63,22 @@ async def lifespan(app: FastAPI):
             await catalog.update_feed()
 
             now = time.time()
+            # Очищення застарілих сесій
             expired = [s_id for s_id, data in SESSION_CACHE.items() if now - data.get("last_active", 0) > SESSION_TTL_SECONDS]
             for s_id in expired:
                 SESSION_CACHE.pop(s_id, None)
+
+            # Очищення лічильників спаму
+            for s_id in list(RATE_LIMIT_CACHE.keys()):
+                RATE_LIMIT_CACHE[s_id] = [t for t in RATE_LIMIT_CACHE[s_id] if now - t < 60]
+                if not RATE_LIMIT_CACHE[s_id]:
+                    RATE_LIMIT_CACHE.pop(s_id, None)
 
     task = asyncio.create_task(periodic_refresh())
     yield
     task.cancel()
 
-app = FastAPI(title="ABV Himiya AI Pro", lifespan=lifespan)
+app = FastAPI(title="ABV Himiya AI Commercial", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -82,23 +91,21 @@ app.add_middleware(
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 SYSTEM_INSTRUCTION = """
-Ти — провідний технолог-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
-Твоє завдання — технічно грамотно підбирати матеріали (клеї, герметики, ґрунтовки, фарби, філаменти), прораховувати витрати та допомагати клієнтам швидко оформити замовлення.
+Ти — провідний експерт-технолог інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
+Твоє завдання — професійно консультувати щодо властивостей товарів, прораховувати витрати та допомагати швидко оформити замовлення.
 
-ПРАВИЛА РОБОТИ:
-1. Спирайся ТІЛЬКИ на наданий список товарів каталогу Хорошоп.
-2. Для кожного рекомендованого матеріалу обов'язково надавай:
-   - Повну точну назву;
-   - Актуальну ціну та статус ("В наявності" чи "Під замовлення");
-   - Чому саме цей склад підходить під завдання;
-   - Активне посилання: [Переглянути товар на сайті](URL).
-3. Якщо клієнт висловлює намір купити ("хочу замовити", "купую", "оформіть", "як забрати"):
-   - Запропонуй швидке замовлення: попроси вказати номер телефону та ім'я для підтвердження менеджером.
-4. Якщо клієнт уже написав номер телефону:
-   - Підтверди, що замовлення прийнято в обробку, і зазнач, що менеджер зателефонує найближчим часом для уточнення оплати й доставки.
-5. Якщо товару немає в наявності:
-   - Ввічливо запропонуй залишити номер телефону або зв'язатися з технічним відділом для спецзамовлення чи підбору заводського аналога.
-6. Відповідай чітко, професійно та структуровано українською мовою.
+ПРАВИЛА ОФОРМЛЕННЯ ВІДПОВІДЕЙ:
+1. Коли рекомендуєш товар, обов'язково додай спеціальний тег картки:
+   [PRODUCT|Назва товару|Ціна|Наявність (В наявності або Під замовлення)|URL|Артикул]
+   Приклад:
+   [PRODUCT|Клей HERCUL E300|245 UAH|В наявності|https://abvhimiya.com.ua/p123|008051]
+2. Текстом стисло поясни, чому саме цей матеріал підходить для завдання клієнта.
+3. ВТРАЧЕНИЙ ПОПИТ (Якщо потрібного товару немає або він "Під замовлення"):
+   - Чесно повідоми про це.
+   - Запропонуй: "Можу підібрати перевірений заводський аналог або зафіксувати замовлення з резервом на складі. Залиште свій номер телефону, і наш технолог проконсультує вас".
+4. Якщо клієнт надсилає номер телефону в чат:
+   - Підтверди, що контакти передано менеджеру, і повідом, що з ним зв'яжуться найближчим часом.
+5. Відповідай виключно українською мовою, конкретно, без зайвої води.
 """
 
 class ChatRequest(BaseModel):
@@ -107,6 +114,14 @@ class ChatRequest(BaseModel):
 
 class ChatResponse(BaseModel):
     reply: str
+
+class QuickOrderRequest(BaseModel):
+    name: str
+    phone: str
+    product_name: str
+    product_price: str
+    product_code: str
+    session_id: Optional[str] = "default_user"
 
 @app.get("/")
 def root():
@@ -126,6 +141,41 @@ async def trigger_refresh():
         "updated_at": catalog.last_updated
     }
 
+@app.post("/api/quick-order")
+async def quick_order_endpoint(req: QuickOrderRequest):
+    """Пункт 1: Обробка замовлення 'В 1 клік' без переписки"""
+    clean_phone = req.phone.strip()
+    if not clean_phone or len(re.sub(r"\D", "", clean_phone)) < 9:
+        raise HTTPException(status_code=400, detail="Некоректний номер телефону")
+
+    safe_name = html.escape(req.name.strip() or "Клієнт")
+    safe_phone = html.escape(clean_phone)
+    safe_prod = html.escape(req.product_name)
+    safe_price = html.escape(req.product_price)
+    safe_code = html.escape(req.product_code)
+
+    alert_text = (
+        f"⚡ <b>ЗАМОВЛЕННЯ В 1 КЛІК!</b>\n\n"
+        f"👤 <b>Ім'я:</b> {safe_name}\n"
+        f"📞 <b>Телефон:</b> <code>{safe_phone}</code>\n"
+        f"📦 <b>Товар:</b> {safe_prod}\n"
+        f"🏷 <b>Артикул:</b> <code>{safe_code}</code>\n"
+        f"💰 <b>Ціна:</b> {safe_price}\n\n"
+        f"🚀 <i>Терміново зв'яжіться для оформлення відправки!</i>"
+    )
+    asyncio.create_task(send_telegram_alert(alert_text))
+
+    # Збереження в журнал
+    RECENT_LOGS.insert(0, {
+        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "session_id": req.session_id,
+        "user": f"[ШВИДКЕ ЗАМОВЛЕННЯ] {safe_prod} ({safe_phone})",
+        "bot": "Заявку прийнято в 1 клік та надіслано в Telegram менеджеру.",
+        "is_order": True
+    })
+
+    return {"status": "success", "message": "Замовлення прийнято! Менеджер скоро зателефонує."}
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     user_query = req.message.strip()
@@ -133,6 +183,15 @@ async def chat_endpoint(req: ChatRequest):
 
     if not user_query:
         raise HTTPException(status_code=400, detail="Порожнє повідомлення")
+
+    # Пункт 4: Обмеження спаму (Rate Limiting)
+    now = time.time()
+    user_requests = RATE_LIMIT_CACHE.get(session_id, [])
+    user_requests = [t for t in user_requests if now - t < 60]
+    if len(user_requests) >= MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Забагато запитів. Зачекайте хвилинку.")
+    user_requests.append(now)
+    RATE_LIMIT_CACHE[session_id] = user_requests
 
     phone_match = PHONE_REGEX.search(user_query)
 
@@ -203,7 +262,7 @@ async def chat_endpoint(req: ChatRequest):
             "history": history[-MAX_HISTORY_TURNS:]
         }
 
-        # Фіксація в локальному буфері журналів
+        # Фіксація в логах
         log_entry = {
             "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "session_id": session_id,
@@ -215,7 +274,6 @@ async def chat_endpoint(req: ChatRequest):
         if len(RECENT_LOGS) > MAX_SAVED_LOGS:
             RECENT_LOGS.pop()
 
-        # Трансляція в Telegram
         safe_user = html.escape(user_query)
         safe_bot = html.escape(bot_reply[:350]) + ("..." if len(bot_reply) > 350 else "")
 
@@ -242,9 +300,8 @@ async def chat_endpoint(req: ChatRequest):
 
 @app.get("/admin/logs", response_class=HTMLResponse)
 def view_logs(secret: str = Query(..., description="Ключ доступу")):
-    """Захищена веб-сторінка для перегляду діалогів у браузері"""
     if secret != ADMIN_SECRET:
-        raise HTTPException(status_code=403, detail="Доступ заборонено. Невірний ключ secret.")
+        raise HTTPException(status_code=403, detail="Доступ заборонено.")
 
     rows_html = ""
     for item in RECENT_LOGS:
@@ -265,7 +322,7 @@ def view_logs(secret: str = Query(..., description="Ключ доступу")):
         """
 
     if not rows_html:
-        rows_html = "<div style='color:#64748b;text-align:center;padding:40px;'>Діалогів поки що немає. Зробіть тестове повідомлення у віджеті!</div>"
+        rows_html = "<div style='color:#64748b;text-align:center;padding:40px;'>Діалогів поки що немає.</div>"
 
     return f"""
     <!DOCTYPE html>
@@ -284,13 +341,11 @@ def view_logs(secret: str = Query(..., description="Ключ доступу")):
         <div class="header">
             <div>
                 <h2 style="margin:0;color:#0f172a;">Журнал діалогів AI-асистента</h2>
-                <div style="font-size:13px;color:#64748b;">Збережено останніх записів: {len(RECENT_LOGS)} / {MAX_SAVED_LOGS}</div>
+                <div style="font-size:13px;color:#64748b;">Збережено записів: {len(RECENT_LOGS)} / {MAX_SAVED_LOGS}</div>
             </div>
             <a href="javascript:location.reload()" class="btn">🔄 Оновити</a>
         </div>
-        <div>
-            {rows_html}
-        </div>
+        <div>{rows_html}</div>
     </body>
     </html>
     """
@@ -318,7 +373,7 @@ def get_widget_page():
             #ai-chat-launcher:hover { transform: scale(1.08); }
             #ai-chat-window {
                 position: fixed; bottom: 95px; right: 25px;
-                width: 380px; max-width: calc(100vw - 40px); height: 550px; max-height: calc(100vh - 120px);
+                width: 400px; max-width: calc(100vw - 30px); height: 580px; max-height: calc(100vh - 120px);
                 background: #ffffff; border-radius: 16px; box-shadow: 0 12px 35px rgba(0,0,0,0.18);
                 display: none; flex-direction: column; overflow: hidden;
                 font-family: inherit; z-index: 999999; border: 1px solid #e2e8f0;
@@ -331,23 +386,57 @@ def get_widget_page():
                 flex: 1; padding: 14px; overflow-y: auto; background: #f8fafc;
                 font-size: 13.5px; line-height: 1.5; color: #1e293b;
             }
-            .msg { margin-bottom: 12px; max-width: 88%; padding: 10px 14px; border-radius: 12px; word-break: break-word; }
+            .msg { margin-bottom: 12px; max-width: 90%; padding: 10px 14px; border-radius: 12px; word-break: break-word; }
             .msg.user { background: #0284c7; color: #ffffff; margin-left: auto; border-bottom-right-radius: 2px; }
             .msg.bot { background: #ffffff; color: #1e293b; margin-right: auto; border-bottom-left-radius: 2px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }
-            .msg a {
-                display: inline-block; background: #0284c7; color: #ffffff !important;
-                padding: 6px 12px; border-radius: 6px; font-weight: 600;
-                text-decoration: none; margin-top: 6px; font-size: 12.5px;
+
+            /* Вітрина товарів у чаті */
+            .prod-card {
+                background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
+                padding: 12px; margin: 10px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04);
             }
-            .msg a:hover { background: #0369a1; }
+            .prod-title { font-weight: 700; color: #0f172a; margin-bottom: 4px; font-size: 14px; }
+            .prod-meta { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; font-size: 12.5px; }
+            .prod-price { font-size: 15px; font-weight: 700; color: #0284c7; }
+            .badge-instock { background: #dcfce7; color: #15803d; padding: 2px 6px; border-radius: 6px; font-weight: 600; font-size: 11px; }
+            .badge-outstock { background: #fef9c3; color: #854d0e; padding: 2px 6px; border-radius: 6px; font-weight: 600; font-size: 11px; }
+            .prod-actions { display: flex; gap: 6px; margin-top: 8px; }
+            .btn-view {
+                flex: 1; text-align: center; background: #f1f5f9; color: #334155; text-decoration: none;
+                padding: 6px 8px; border-radius: 6px; font-size: 12px; font-weight: 600; border: 1px solid #cbd5e1;
+            }
+            .btn-order-fast {
+                flex: 1.2; background: #0284c7; color: #ffffff; border: none; border-radius: 6px;
+                padding: 6px 8px; font-size: 12px; font-weight: 600; cursor: pointer; text-align: center;
+            }
+            .btn-order-fast:hover { background: #0369a1; }
+
             #ai-chat-input-box { display: flex; border-top: 1px solid #e2e8f0; background: #ffffff; padding: 6px; }
             #ai-chat-input { flex: 1; border: none; padding: 10px 12px; outline: none; font-size: 13.5px; }
             #ai-chat-send { background: #0284c7; color: #ffffff; border: none; padding: 0 16px; cursor: pointer; font-weight: 600; border-radius: 8px; }
+
+            /* Модальне вікно замовлення в 1 клік */
+            #fast-order-modal {
+                display: none; position: absolute; inset: 0; background: rgba(15, 23, 42, 0.6);
+                z-index: 1000000; align-items: center; justify-content: center; padding: 16px;
+            }
+            .modal-content {
+                background: #ffffff; border-radius: 12px; padding: 18px; width: 100%; max-width: 310px;
+                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
+            }
+            .modal-title { font-weight: 700; margin-bottom: 8px; font-size: 15px; color: #0f172a; }
+            .modal-input {
+                width: 100%; box-sizing: border-box; padding: 9px 12px; border: 1px solid #cbd5e1;
+                border-radius: 6px; margin-bottom: 8px; font-size: 13px; outline: none;
+            }
+            .modal-btns { display: flex; gap: 8px; margin-top: 10px; }
+            .btn-submit { flex: 1; background: #0284c7; color: #fff; border: none; padding: 8px; border-radius: 6px; font-weight: 600; cursor: pointer; }
+            .btn-cancel { background: #f1f5f9; color: #64748b; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
         </style>
     </head>
     <body>
-        <h2>Тестова зона ABV Himiya</h2>
-        <p>Клікніть на значок 💬 праворуч знизу для початку консультації.</p>
+        <h2>Онлайн-консультант ABV Himiya</h2>
+        <p>Клікніть на синю іконку 💬 у нижньому правому кутку.</p>
 
         <div id="ai-chat-launcher" onclick="toggleAIChat()">💬</div>
 
@@ -359,12 +448,28 @@ def get_widget_page():
                 </div>
                 <span onclick="toggleAIChat()" style="cursor:pointer;font-size:18px;">✕</span>
             </div>
+            
             <div id="ai-chat-messages">
-                <div class="msg bot">Вітаю! Чим можу допомогти щодо вибору клеїв, фарб, герметиків чи пластику для 3D-друку?</div>
+                <div class="msg bot">Вітаю! Чим можу допомогти щодо вибору клеїв, герметиків, фарб чи пластику для 3D-друку?</div>
             </div>
+
             <div id="ai-chat-input-box">
-                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар чи введіть телефон..." onkeydown="if(event.key==='Enter') sendAIMsg()">
+                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар чи властивості..." onkeydown="if(event.key==='Enter') sendAIMsg()">
                 <button id="ai-chat-send" onclick="sendAIMsg()">➤</button>
+            </div>
+
+            <!-- Спливаюче вікно для швидкого замовлення -->
+            <div id="fast-order-modal">
+                <div class="modal-content">
+                    <div class="modal-title">⚡ Швидке замовлення</div>
+                    <div id="modal-product-name" style="font-size: 12.5px; color: #475569; margin-bottom: 10px;"></div>
+                    <input type="text" id="fast-name" class="modal-input" placeholder="Ваше ім'я">
+                    <input type="tel" id="fast-phone" class="modal-input" placeholder="Номер телефону (+380...)">
+                    <div class="modal-btns">
+                        <button class="btn-cancel" onclick="closeOrderModal()">Скасувати</button>
+                        <button class="btn-submit" onclick="submitQuickOrder()">Замовити</button>
+                    </div>
+                </div>
             </div>
         </div>
 
@@ -375,11 +480,55 @@ def get_widget_page():
                 localStorage.setItem("abv_chat_session", sessionId);
             }
 
+            let currentOrderData = null;
+
             function toggleAIChat() {
                 const win = document.getElementById("ai-chat-window");
                 win.style.display = (win.style.display === "flex") ? "none" : "flex";
                 if (win.style.display === "flex") {
                     document.getElementById("ai-chat-input").focus();
+                }
+            }
+
+            function openOrderModal(name, price, code) {
+                currentOrderData = { name, price, code };
+                document.getElementById("modal-product-name").innerText = `${name} — ${price}`;
+                document.getElementById("fast-order-modal").style.display = "flex";
+            }
+
+            function closeOrderModal() {
+                document.getElementById("fast-order-modal").style.display = "none";
+            }
+
+            async function submitQuickOrder() {
+                const name = document.getElementById("fast-name").value.trim();
+                const phone = document.getElementById("fast-phone").value.trim();
+                if (!phone) {
+                    alert("Будь ласка, вкажіть контактний номер телефону!");
+                    return;
+                }
+
+                try {
+                    const res = await fetch("/api/quick-order", {
+                        method: "POST",
+                        headers: {"Content-Type": "application/json"},
+                        body: JSON.stringify({
+                            name: name,
+                            phone: phone,
+                            product_name: currentOrderData.name,
+                            product_price: currentOrderData.price,
+                            product_code: currentOrderData.code,
+                            session_id: sessionId
+                        })
+                    });
+                    const data = await res.json();
+                    closeOrderModal();
+
+                    const box = document.getElementById("ai-chat-messages");
+                    box.innerHTML += `<div class="msg bot" style="border-left: 3px solid #16a34a;"><b>Дякуємо, ${escapeHtml(name || 'клієнте')}!</b> Заявку на <b>${escapeHtml(currentOrderData.name)}</b> прийнято в обробку. Менеджер зателефонує вам на номер ${escapeHtml(phone)}!</div>`;
+                    box.scrollTop = box.scrollHeight;
+                } catch(e) {
+                    alert("Помилка відправки замовлення. Спробуйте пізніше.");
                 }
             }
 
@@ -394,7 +543,7 @@ def get_widget_page():
                 box.scrollTop = box.scrollHeight;
 
                 const botId = "ai-bot-" + Date.now();
-                box.innerHTML += `<div class="msg bot" id="${botId}"><i>Секунду, перевіряю...</i></div>`;
+                box.innerHTML += `<div class="msg bot" id="${botId}"><i>Секунду, аналізую каталог...</i></div>`;
                 box.scrollTop = box.scrollHeight;
 
                 try {
@@ -403,9 +552,36 @@ def get_widget_page():
                         headers: {"Content-Type": "application/json"},
                         body: JSON.stringify({ message: text, session_id: sessionId })
                     });
+                    if (res.status === 429) {
+                        document.getElementById(botId).innerText = "Забагато повідомлень. Будь ласка, зачекайте хвилину.";
+                        return;
+                    }
                     const data = await res.json();
 
-                    let formatted = escapeHtml(data.reply)
+                    let raw = data.reply;
+
+                    // Парсинг тегів [PRODUCT|...] у стильні вітрини
+                    raw = raw.replace(/\\[PRODUCT\\|(.*?)\\|(.*?)\\|(.*?)\\|(.*?)\\|(.*?)\\]/g, function(match, pName, pPrice, pAvail, pUrl, pCode) {
+                        const isAvail = pAvail.includes("наявності");
+                        const badgeClass = isAvail ? "badge-instock" : "badge-outstock";
+                        const badgeText = isAvail ? "🟢 В наявності" : "🟡 Під замовлення";
+
+                        return `
+                        <div class="prod-card">
+                            <div class="prod-title">${escapeHtml(pName)}</div>
+                            <div class="prod-meta">
+                                <span class="prod-price">${escapeHtml(pPrice)}</span>
+                                <span class="${badgeClass}">${badgeText}</span>
+                            </div>
+                            <div class="prod-actions">
+                                <a href="${escapeHtml(pUrl)}" target="_blank" class="btn-view">Картка ↗</a>
+                                <button class="btn-order-fast" onclick="openOrderModal('${escapeHtml(pName).replace(/'/g, "\\\\'")}', '${escapeHtml(pPrice)}', '${escapeHtml(pCode)}')">⚡ В 1 клік</button>
+                            </div>
+                        </div>`;
+                    });
+
+                    // Звичайне форматування для решти тексту
+                    let formatted = raw
                         .replace(/\\[(.*?)\\]\\((https?:\\/\\/.*?)\\)/g, '<a href="$2" target="_blank">$1 ↗</a>')
                         .replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>')
                         .replace(/\\n/g, "<br>");
