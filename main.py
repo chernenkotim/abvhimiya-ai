@@ -3,11 +3,12 @@ import re
 import html
 import time
 import asyncio
+from datetime import datetime
 from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
@@ -21,16 +22,20 @@ load_dotenv()
 
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+ADMIN_SECRET = os.getenv("ADMIN_SECRET", "abv2026")
 
-# Точний шаблон українського мобільного номера
 PHONE_REGEX = re.compile(r"(?:\+?38\s*)?(?:\(0\d{2}\)|0\d{2})[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}")
 
 SESSION_CACHE: Dict[str, dict] = {}
 MAX_HISTORY_TURNS = 8
-SESSION_TTL_SECONDS = 14400  # Збільшено до 4 годин завдяки ресурсам Pro
+SESSION_TTL_SECONDS = 14400
+
+# Буфер історії повідомлень для перегляду у веб-панелі (останні 150 подій)
+RECENT_LOGS: List[dict] = []
+MAX_SAVED_LOGS = 150
 
 async def send_telegram_alert(text: str):
-    """Безпечна відправка сповіщення про замовлення у Telegram-чат"""
+    """Відправка реплік або замовлень у Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -47,7 +52,6 @@ async def send_telegram_alert(text: str):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Первинна індексація каталогу при старті
     await catalog.update_feed()
 
     async def periodic_refresh():
@@ -114,7 +118,6 @@ def favicon():
 
 @app.post("/api/refresh-catalog")
 async def trigger_refresh():
-    """Ендпоінт миттєвого позачергового оновлення каталогу з фіда"""
     await catalog.update_feed()
     return {
         "status": "success",
@@ -141,7 +144,6 @@ async def chat_endpoint(req: ChatRequest):
         last_user = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
         search_query = f"{last_user} {user_query}"
 
-    # Збільшено вибірку до 7 карток завдяки ресурсам плану Pro
     relevant_items = catalog.search_relevant_products(search_query, limit=7)
 
     catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ ХОРОШОП:\n"
@@ -170,7 +172,6 @@ async def chat_endpoint(req: ChatRequest):
 
     full_prompt = f"{catalog_context}\n{history_text}Поточне запитання покупця: {user_query}"
 
-    # Найшвидша модель першою в черзі
     candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
     response = None
     last_error = None
@@ -183,7 +184,7 @@ async def chat_endpoint(req: ChatRequest):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.2,
-                    max_output_tokens=700,  # Розширено ліміт токенів для детальних інструкцій
+                    max_output_tokens=700,
                 )
             )
             if response and response.text:
@@ -202,31 +203,97 @@ async def chat_endpoint(req: ChatRequest):
             "history": history[-MAX_HISTORY_TURNS:]
         }
 
-        # Відправка ліда в Telegram з екрануванням HTML
+        # Фіксація в локальному буфері журналів
+        log_entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "session_id": session_id,
+            "user": user_query,
+            "bot": bot_reply,
+            "is_order": bool(phone_match)
+        }
+        RECENT_LOGS.insert(0, log_entry)
+        if len(RECENT_LOGS) > MAX_SAVED_LOGS:
+            RECENT_LOGS.pop()
+
+        # Трансляція в Telegram
+        safe_user = html.escape(user_query)
+        safe_bot = html.escape(bot_reply[:350]) + ("..." if len(bot_reply) > 350 else "")
+
         if phone_match:
-            phone_number = phone_match.group(0).strip()
-            safe_query = html.escape(user_query)
-            
-            recent_dialog = []
-            for h in history[-4:]:
-                safe_speaker = html.escape(h['role'])
-                safe_text = html.escape(h['text'][:140])
-                recent_dialog.append(f"• <b>{safe_speaker}</b>: {safe_text}")
-            
-            summary_dialog = "\n".join(recent_dialog)
-            
-            alert_text = (
-                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З САЙТУ!</b>\n\n"
-                f"📞 <b>Телефон клієнта:</b> <code>{html.escape(phone_number)}</code>\n"
-                f"💬 <b>Запит:</b> {safe_query}\n\n"
-                f"📋 <b>Останні репліки:</b>\n{summary_dialog}\n\n"
-                f"⚡ <i>Передзвоніть клієнту для підтвердження!</i>"
+            phone_num = phone_match.group(0).strip()
+            msg = (
+                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З ЧАТУ!</b>\n"
+                f"📞 <b>Телефон:</b> <code>{html.escape(phone_num)}</code>\n"
+                f"👤 <b>Клієнт:</b> {safe_user}\n"
+                f"🤖 <b>Бот:</b> {safe_bot}"
             )
-            asyncio.create_task(send_telegram_alert(alert_text))
+        else:
+            msg = (
+                f"💬 <b>Нове повідомлення в чаті</b>\n"
+                f"🔑 <b>Сесія:</b> <code>{html.escape(session_id)}</code>\n"
+                f"👤 <b>Клієнт:</b> {safe_user}\n"
+                f"🤖 <b>Бот:</b> {safe_bot}"
+            )
+        asyncio.create_task(send_telegram_alert(msg))
 
         return ChatResponse(reply=bot_reply)
     else:
         return ChatResponse(reply=f"Сервіс оновлює дані каталогу. Помилка: {str(last_error)}")
+
+@app.get("/admin/logs", response_class=HTMLResponse)
+def view_logs(secret: str = Query(..., description="Ключ доступу")):
+    """Захищена веб-сторінка для перегляду діалогів у браузері"""
+    if secret != ADMIN_SECRET:
+        raise HTTPException(status_code=403, detail="Доступ заборонено. Невірний ключ secret.")
+
+    rows_html = ""
+    for item in RECENT_LOGS:
+        badge = "<span style='background:#ef4444;color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;font-weight:700;'>ЗАМОВЛЕННЯ</span>" if item["is_order"] else "<span style='background:#0284c7;color:#fff;padding:2px 8px;border-radius:12px;font-size:11px;'>ПИТАННЯ</span>"
+        rows_html += f"""
+        <div style="background:#fff;border:1px solid #e2e8f0;border-radius:10px;padding:16px;margin-bottom:14px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+            <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;">
+                <div>{badge} <b style="margin-left:6px;font-size:12px;color:#64748b;">Сесія: {html.escape(item['session_id'])}</b></div>
+                <span style="font-size:12px;color:#94a3b8;">{item['time']}</span>
+            </div>
+            <div style="background:#f1f5f9;padding:10px 12px;border-radius:8px;margin-bottom:8px;font-size:13.5px;color:#0f172a;">
+                <b>Клієнт:</b> {html.escape(item['user'])}
+            </div>
+            <div style="background:#f8fafc;border-left:3px solid #0284c7;padding:10px 12px;font-size:13.5px;color:#334155;white-space:pre-wrap;">
+                <b>Асистент:</b> {html.escape(item['bot'])}
+            </div>
+        </div>
+        """
+
+    if not rows_html:
+        rows_html = "<div style='color:#64748b;text-align:center;padding:40px;'>Діалогів поки що немає. Зробіть тестове повідомлення у віджеті!</div>"
+
+    return f"""
+    <!DOCTYPE html>
+    <html lang="uk">
+    <head>
+        <meta charset="UTF-8">
+        <title>Журнал консультацій ABV Himiya</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <style>
+            body {{ font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background:#f8fafc; padding:24px; max-width:960px; margin:auto; }}
+            .header {{ display:flex; justify-content:space-between; align-items:center; margin-bottom:20px; }}
+            .btn {{ background:#0284c7; color:#fff; text-decoration:none; padding:8px 14px; border-radius:8px; font-size:13px; font-weight:600; }}
+        </style>
+    </head>
+    <body>
+        <div class="header">
+            <div>
+                <h2 style="margin:0;color:#0f172a;">Журнал діалогів AI-асистента</h2>
+                <div style="font-size:13px;color:#64748b;">Збережено останніх записів: {len(RECENT_LOGS)} / {MAX_SAVED_LOGS}</div>
+            </div>
+            <a href="javascript:location.reload()" class="btn">🔄 Оновити</a>
+        </div>
+        <div>
+            {rows_html}
+        </div>
+    </body>
+    </html>
+    """
 
 @app.get("/widget", response_class=HTMLResponse)
 def get_widget_page():
