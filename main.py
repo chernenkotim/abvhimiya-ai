@@ -1,12 +1,15 @@
 import os
+import re
+import html
 import time
 import asyncio
 from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 
+import httpx
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
 from google import genai
 from google.genai import types
@@ -16,15 +19,35 @@ from feed_loader import catalog
 
 load_dotenv()
 
-# Структура збереження історії з часом останньої активності
-# session_id: {"last_active": timestamp, "history": [{"role": ..., "text": ...}]}
+# Безпечне зчитування змінних оточення без публічних дефолтів
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
+
+# Точний шаблон українських номерів (+380..., 380..., 050..., 067..., 073...)
+PHONE_REGEX = re.compile(r"(?:\+?38\s*)?(?:\(0\d{2}\)|0\d{2})[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}")
+
 SESSION_CACHE: Dict[str, dict] = {}
 MAX_HISTORY_TURNS = 6
-SESSION_TTL_SECONDS = 7200  # 2 години життя сесії
+SESSION_TTL_SECONDS = 7200  # 2 години
+
+async def send_telegram_alert(text: str):
+    """Безпечна відправка ліда в Telegram з обробкою помилок"""
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
+        return
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            await client.post(url, json={
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": text,
+                "parse_mode": "HTML",
+                "disable_web_page_preview": True
+            })
+    except Exception as e:
+        print(f"Помилка відправки ліда в Telegram: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Сучасний життєвий цикл FastAPI замість застарілого on_event"""
     await catalog.update_feed()
 
     async def periodic_refresh():
@@ -33,13 +56,9 @@ async def lifespan(app: FastAPI):
             await asyncio.sleep(interval)
             await catalog.update_feed()
 
-            # Очищення старих сесій з пам'яті кожну годину
             now = time.time()
-            expired_sessions = [
-                s_id for s_id, s_data in SESSION_CACHE.items()
-                if now - s_data.get("last_active", 0) > SESSION_TTL_SECONDS
-            ]
-            for s_id in expired_sessions:
+            expired = [s_id for s_id, data in SESSION_CACHE.items() if now - data.get("last_active", 0) > SESSION_TTL_SECONDS]
+            for s_id in expired:
                 SESSION_CACHE.pop(s_id, None)
 
     task = asyncio.create_task(periodic_refresh())
@@ -59,22 +78,18 @@ app.add_middleware(
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 SYSTEM_INSTRUCTION = """
-Ти — досвідчений технолог-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
-Твоє завдання — швидко, фахово та ввічливо допомагати клієнтам підбирати потрібні матеріали, розраховувати витрати та орієнтувати за цінами й наявністю.
+Ти — провідний експерт-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
+Твоє завдання — допомагати покупцям з технічним вибором клеїв, герметиків, ґрунтовок, фарб і філаментів, а також сприяти оформленню замовлень.
 
 ПРАВИЛА РОБОТИ:
-1. Завжди використовуй ТІЛЬКИ дані з блоку знайдених товарів. Не вигадуй характеристики, сумісність чи ціни.
-2. Оформлюй знайдені товари структуровано:
-   - Точна назва товару;
-   - Актуальна ціна та статус («В наявності» або «Під замовлення»);
-   - Коротке пояснення, чому саме цей матеріал підходить під завдання;
-   - Активне посилання у форматі: [Переглянути товар на сайті](URL).
-3. Якщо клієнт запитує абстрактно («порадьте клей», «потрібен герметик», «що взяти для підлоги»):
-   - Уточни ключові технічні параметри: тип поверхонь, умови експлуатації (вологість, вулиця/приміщення, вібраційні навантаження).
-   - Якщо в каталозі є очевидний лідер продажів під це завдання — порекомендуй його та запропонуй уточнити деталі.
-4. Якщо товару немає або потрібне специфічне лабораторне застосування:
-   - Ввічливо повідом про це і запропонуй швидкий зв'язок із менеджером магазину за контактами на сайті.
-5. Відповідай стисло, без зайвої "води", виключно українською мовою.
+1. Завжди спирайся ТІЛЬКИ на наданий перелік товарів каталогу. Вказуй точну назву, актуальну ціну, статус наявності та клікабельне посилання: [Переглянути на сайті](URL).
+2. Якщо клієнт хоче замовити чи купити товар ("купити", "замовити", "оформіть", "беру", "яка доставка"):
+   - Запропонуй швидке замовлення: попроси вказати контактний номер телефону та ім'я для зв'язку з менеджером.
+3. Якщо клієнт уже надав свій номер телефону:
+   - Підтверди, що замовлення зафіксовано, і зазнач, що менеджер зателефонує найближчим часом для підтвердження наявності та оформлення доставки.
+4. Якщо потрібного товару немає в наявності:
+   - Ввічливо запропонуй залишити контакти або зв'язатися з технічним відділом для замовлення зі складу виробника чи підбору сертифікованого аналогу.
+5. Відповідай структуровано, лаконічно, українською мовою.
 """
 
 class ChatRequest(BaseModel):
@@ -84,6 +99,14 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
 
+@app.get("/")
+def root():
+    return RedirectResponse(url="/widget")
+
+@app.get("/favicon.ico", include_in_schema=False)
+def favicon():
+    return Response(status_code=204)
+
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
     user_query = req.message.strip()
@@ -92,17 +115,17 @@ async def chat_endpoint(req: ChatRequest):
     if not user_query:
         raise HTTPException(status_code=400, detail="Порожнє повідомлення")
 
-    # 1. Формування пошукового контексту з урахуванням історії
+    phone_match = PHONE_REGEX.search(user_query)
+
     session_data = SESSION_CACHE.get(session_id, {"last_active": time.time(), "history": []})
     history = session_data["history"]
 
     search_query = user_query
-    # Якщо питання надто коротке ("а скільки сохне?", "а білий є?"), підтягуємо тему з минулого питання
     if len(user_query.split()) <= 3 and history:
-        last_user_msg = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
-        search_query = f"{last_user_msg} {user_query}"
+        last_user = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
+        search_query = f"{last_user} {user_query}"
 
-    relevant_items = catalog.search_relevant_products(search_query, limit=6)
+    relevant_items = catalog.search_relevant_products(search_query, limit=5)
 
     catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ ХОРОШОП:\n"
     if relevant_items:
@@ -120,7 +143,6 @@ async def chat_endpoint(req: ChatRequest):
     else:
         catalog_context += "Прямих збігів за ключовими словами не знайдено.\n"
 
-    # 2. Формування історії діалогу
     history_text = ""
     if history:
         history_text = "ПОПЕРЕДНІЙ ДІАЛОГ:\n"
@@ -131,8 +153,7 @@ async def chat_endpoint(req: ChatRequest):
 
     full_prompt = f"{catalog_context}\n{history_text}Поточне запитання покупця: {user_query}"
 
-    # 3. Виклик Gemini API
-    candidate_models = ["gemini-3.8-flash", "gemini-3.5-flash-lite"]
+    candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
     response = None
     last_error = None
 
@@ -144,6 +165,7 @@ async def chat_endpoint(req: ChatRequest):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.2,
+                    max_output_tokens=450,
                 )
             )
             if response and response.text:
@@ -155,7 +177,6 @@ async def chat_endpoint(req: ChatRequest):
     if response and response.text:
         bot_reply = response.text
 
-        # Зберігаємо оновлену історію
         history.append({"role": "user", "text": user_query})
         history.append({"role": "bot", "text": bot_reply})
         SESSION_CACHE[session_id] = {
@@ -163,9 +184,31 @@ async def chat_endpoint(req: ChatRequest):
             "history": history[-MAX_HISTORY_TURNS:]
         }
 
+        # Відправка ліда в Telegram з екрануванням HTML (захист від помилок 400)
+        if phone_match:
+            phone_number = phone_match.group(0).strip()
+            safe_query = html.escape(user_query)
+            
+            recent_dialog = []
+            for h in history[-4:]:
+                safe_speaker = html.escape(h['role'])
+                safe_text = html.escape(h['text'][:120])
+                recent_dialog.append(f"• <b>{safe_speaker}</b>: {safe_text}")
+            
+            summary_dialog = "\n".join(recent_dialog)
+            
+            alert_text = (
+                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З AI-ЧАТУ!</b>\n\n"
+                f"📞 <b>Телефон:</b> <code>{html.escape(phone_number)}</code>\n"
+                f"👤 <b>Повідомлення:</b> {safe_query}\n\n"
+                f"📋 <b>Діалог:</b>\n{summary_dialog}\n\n"
+                f"⚡ <i>Передзвоніть клієнту найближчим часом!</i>"
+            )
+            asyncio.create_task(send_telegram_alert(alert_text))
+
         return ChatResponse(reply=bot_reply)
     else:
-        return ChatResponse(reply=f"Сервіс тимчасово оновлює каталог або перевантажений. Помилка: {str(last_error)}")
+        return ChatResponse(reply=f"Сервіс тимчасово оновлює каталог. Помилка: {str(last_error)}")
 
 @app.get("/widget", response_class=HTMLResponse)
 def get_widget_page():
@@ -207,19 +250,19 @@ def get_widget_page():
             .msg.user { background: #0284c7; color: #ffffff; margin-left: auto; border-bottom-right-radius: 2px; }
             .msg.bot { background: #ffffff; color: #1e293b; margin-right: auto; border-bottom-left-radius: 2px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }
             .msg a {
-                display: inline-block; background: #f0f9ff; color: #0284c7;
-                padding: 4px 8px; border-radius: 6px; font-weight: 600;
-                text-decoration: none; border: 1px solid #bae6fd; margin-top: 4px;
+                display: inline-block; background: #0284c7; color: #ffffff !important;
+                padding: 6px 12px; border-radius: 6px; font-weight: 600;
+                text-decoration: none; margin-top: 6px; font-size: 12.5px;
             }
-            .msg a:hover { background: #e0f2fe; }
+            .msg a:hover { background: #0369a1; }
             #ai-chat-input-box { display: flex; border-top: 1px solid #e2e8f0; background: #ffffff; padding: 6px; }
             #ai-chat-input { flex: 1; border: none; padding: 10px 12px; outline: none; font-size: 13.5px; }
             #ai-chat-send { background: #0284c7; color: #ffffff; border: none; padding: 0 16px; cursor: pointer; font-weight: 600; border-radius: 8px; }
         </style>
     </head>
     <body>
-        <h2>Тестова зона магазину abvhimiya.com.ua</h2>
-        <p>Чат закріплено праворуч унизу. Клікніть на синій значок 💬 для консультації.</p>
+        <h2>Тестова зона ABV Himiya</h2>
+        <p>Клікніть на значок 💬 праворуч знизу для початку консультації.</p>
 
         <div id="ai-chat-launcher" onclick="toggleAIChat()">💬</div>
 
@@ -232,16 +275,15 @@ def get_widget_page():
                 <span onclick="toggleAIChat()" style="cursor:pointer;font-size:18px;">✕</span>
             </div>
             <div id="ai-chat-messages">
-                <div class="msg bot">Вітаю! Чим можу допомогти щодо вибору клеїв, герметиків, ґрунтовок або пластику для 3D-друку?</div>
+                <div class="msg bot">Вітаю! Чим можу допомогти щодо вибору клеїв, фарб, герметиків чи пластику для 3D-друку?</div>
             </div>
             <div id="ai-chat-input-box">
-                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар, ціну, витрату..." onkeydown="if(event.key==='Enter') sendAIMsg()">
+                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар чи введіть телефон..." onkeydown="if(event.key==='Enter') sendAIMsg()">
                 <button id="ai-chat-send" onclick="sendAIMsg()">➤</button>
             </div>
         </div>
 
         <script>
-            // Зберігаємо session_id у localStorage, щоб сесія не зникала при переході між сторінками сайту
             let sessionId = localStorage.getItem("abv_chat_session");
             if (!sessionId) {
                 sessionId = "sess_" + Math.random().toString(36).substring(2, 10);
@@ -267,7 +309,7 @@ def get_widget_page():
                 box.scrollTop = box.scrollHeight;
 
                 const botId = "ai-bot-" + Date.now();
-                box.innerHTML += `<div class="msg bot" id="${botId}"><i>Шукаю в каталозі...</i></div>`;
+                box.innerHTML += `<div class="msg bot" id="${botId}"><i>Секунду, перевіряю...</i></div>`;
                 box.scrollTop = box.scrollHeight;
 
                 try {
