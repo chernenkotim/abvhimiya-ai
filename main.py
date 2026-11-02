@@ -19,19 +19,18 @@ from feed_loader import catalog
 
 load_dotenv()
 
-# Безпечне зчитування змінних оточення без публічних дефолтів
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 
-# Точний шаблон українських номерів (+380..., 380..., 050..., 067..., 073...)
+# Точний шаблон українського мобільного номера
 PHONE_REGEX = re.compile(r"(?:\+?38\s*)?(?:\(0\d{2}\)|0\d{2})[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}")
 
 SESSION_CACHE: Dict[str, dict] = {}
-MAX_HISTORY_TURNS = 6
-SESSION_TTL_SECONDS = 7200  # 2 години
+MAX_HISTORY_TURNS = 8
+SESSION_TTL_SECONDS = 14400  # Збільшено до 4 годин завдяки ресурсам Pro
 
 async def send_telegram_alert(text: str):
-    """Безпечна відправка ліда в Telegram з обробкою помилок"""
+    """Безпечна відправка сповіщення про замовлення у Telegram-чат"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -44,14 +43,15 @@ async def send_telegram_alert(text: str):
                 "disable_web_page_preview": True
             })
     except Exception as e:
-        print(f"Помилка відправки ліда в Telegram: {e}")
+        print(f"Помилка надсилання в Telegram: {e}")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Первинна індексація каталогу при старті
     await catalog.update_feed()
 
     async def periodic_refresh():
-        interval = int(os.getenv("REFRESH_INTERVAL_MINUTES", "60")) * 60
+        interval = int(os.getenv("REFRESH_INTERVAL_MINUTES", "30")) * 60
         while True:
             await asyncio.sleep(interval)
             await catalog.update_feed()
@@ -65,7 +65,7 @@ async def lifespan(app: FastAPI):
     yield
     task.cancel()
 
-app = FastAPI(title="ABV Himiya AI Assistant", lifespan=lifespan)
+app = FastAPI(title="ABV Himiya AI Pro", lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
@@ -78,18 +78,23 @@ app.add_middleware(
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 SYSTEM_INSTRUCTION = """
-Ти — провідний експерт-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
-Твоє завдання — допомагати покупцям з технічним вибором клеїв, герметиків, ґрунтовок, фарб і філаментів, а також сприяти оформленню замовлень.
+Ти — провідний технолог-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
+Твоє завдання — технічно грамотно підбирати матеріали (клеї, герметики, ґрунтовки, фарби, філаменти), прораховувати витрати та допомагати клієнтам швидко оформити замовлення.
 
 ПРАВИЛА РОБОТИ:
-1. Завжди спирайся ТІЛЬКИ на наданий перелік товарів каталогу. Вказуй точну назву, актуальну ціну, статус наявності та клікабельне посилання: [Переглянути на сайті](URL).
-2. Якщо клієнт хоче замовити чи купити товар ("купити", "замовити", "оформіть", "беру", "яка доставка"):
-   - Запропонуй швидке замовлення: попроси вказати контактний номер телефону та ім'я для зв'язку з менеджером.
-3. Якщо клієнт уже надав свій номер телефону:
-   - Підтверди, що замовлення зафіксовано, і зазнач, що менеджер зателефонує найближчим часом для підтвердження наявності та оформлення доставки.
-4. Якщо потрібного товару немає в наявності:
-   - Ввічливо запропонуй залишити контакти або зв'язатися з технічним відділом для замовлення зі складу виробника чи підбору сертифікованого аналогу.
-5. Відповідай структуровано, лаконічно, українською мовою.
+1. Спирайся ТІЛЬКИ на наданий список товарів каталогу Хорошоп.
+2. Для кожного рекомендованого матеріалу обов'язково надавай:
+   - Повну точну назву;
+   - Актуальну ціну та статус ("В наявності" чи "Під замовлення");
+   - Чому саме цей склад підходить під завдання;
+   - Активне посилання: [Переглянути товар на сайті](URL).
+3. Якщо клієнт висловлює намір купити ("хочу замовити", "купую", "оформіть", "як забрати"):
+   - Запропонуй швидке замовлення: попроси вказати номер телефону та ім'я для підтвердження менеджером.
+4. Якщо клієнт уже написав номер телефону:
+   - Підтверди, що замовлення прийнято в обробку, і зазнач, що менеджер зателефонує найближчим часом для уточнення оплати й доставки.
+5. Якщо товару немає в наявності:
+   - Ввічливо запропонуй залишити номер телефону або зв'язатися з технічним відділом для спецзамовлення чи підбору заводського аналога.
+6. Відповідай чітко, професійно та структуровано українською мовою.
 """
 
 class ChatRequest(BaseModel):
@@ -106,6 +111,17 @@ def root():
 @app.get("/favicon.ico", include_in_schema=False)
 def favicon():
     return Response(status_code=204)
+
+@app.post("/api/refresh-catalog")
+async def trigger_refresh():
+    """Ендпоінт миттєвого позачергового оновлення каталогу з фіда"""
+    await catalog.update_feed()
+    return {
+        "status": "success",
+        "message": "Каталог успішно оновлено!",
+        "total_products": len(catalog.products),
+        "updated_at": catalog.last_updated
+    }
 
 @app.post("/api/chat", response_model=ChatResponse)
 async def chat_endpoint(req: ChatRequest):
@@ -125,7 +141,8 @@ async def chat_endpoint(req: ChatRequest):
         last_user = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
         search_query = f"{last_user} {user_query}"
 
-    relevant_items = catalog.search_relevant_products(search_query, limit=5)
+    # Збільшено вибірку до 7 карток завдяки ресурсам плану Pro
+    relevant_items = catalog.search_relevant_products(search_query, limit=7)
 
     catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ ХОРОШОП:\n"
     if relevant_items:
@@ -153,6 +170,7 @@ async def chat_endpoint(req: ChatRequest):
 
     full_prompt = f"{catalog_context}\n{history_text}Поточне запитання покупця: {user_query}"
 
+    # Найшвидша модель першою в черзі
     candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
     response = None
     last_error = None
@@ -165,7 +183,7 @@ async def chat_endpoint(req: ChatRequest):
                 config=types.GenerateContentConfig(
                     system_instruction=SYSTEM_INSTRUCTION,
                     temperature=0.2,
-                    max_output_tokens=450,
+                    max_output_tokens=700,  # Розширено ліміт токенів для детальних інструкцій
                 )
             )
             if response and response.text:
@@ -184,7 +202,7 @@ async def chat_endpoint(req: ChatRequest):
             "history": history[-MAX_HISTORY_TURNS:]
         }
 
-        # Відправка ліда в Telegram з екрануванням HTML (захист від помилок 400)
+        # Відправка ліда в Telegram з екрануванням HTML
         if phone_match:
             phone_number = phone_match.group(0).strip()
             safe_query = html.escape(user_query)
@@ -192,23 +210,23 @@ async def chat_endpoint(req: ChatRequest):
             recent_dialog = []
             for h in history[-4:]:
                 safe_speaker = html.escape(h['role'])
-                safe_text = html.escape(h['text'][:120])
+                safe_text = html.escape(h['text'][:140])
                 recent_dialog.append(f"• <b>{safe_speaker}</b>: {safe_text}")
             
             summary_dialog = "\n".join(recent_dialog)
             
             alert_text = (
-                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З AI-ЧАТУ!</b>\n\n"
-                f"📞 <b>Телефон:</b> <code>{html.escape(phone_number)}</code>\n"
-                f"👤 <b>Повідомлення:</b> {safe_query}\n\n"
-                f"📋 <b>Діалог:</b>\n{summary_dialog}\n\n"
-                f"⚡ <i>Передзвоніть клієнту найближчим часом!</i>"
+                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З САЙТУ!</b>\n\n"
+                f"📞 <b>Телефон клієнта:</b> <code>{html.escape(phone_number)}</code>\n"
+                f"💬 <b>Запит:</b> {safe_query}\n\n"
+                f"📋 <b>Останні репліки:</b>\n{summary_dialog}\n\n"
+                f"⚡ <i>Передзвоніть клієнту для підтвердження!</i>"
             )
             asyncio.create_task(send_telegram_alert(alert_text))
 
         return ChatResponse(reply=bot_reply)
     else:
-        return ChatResponse(reply=f"Сервіс тимчасово оновлює каталог. Помилка: {str(last_error)}")
+        return ChatResponse(reply=f"Сервіс оновлює дані каталогу. Помилка: {str(last_error)}")
 
 @app.get("/widget", response_class=HTMLResponse)
 def get_widget_page():
