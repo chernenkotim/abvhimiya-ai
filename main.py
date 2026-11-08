@@ -8,7 +8,7 @@ from typing import List, Dict, Optional
 from contextlib import asynccontextmanager
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from pydantic import BaseModel
@@ -24,12 +24,15 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "")
 ADMIN_SECRET = os.getenv("ADMIN_SECRET", "abv2026")
 
+SALESDRIVE_DOMAIN = os.getenv("SALESDRIVE_DOMAIN", "").strip().rstrip("/")
+SALESDRIVE_API_KEY = os.getenv("SALESDRIVE_API_KEY", "").strip()
+
 PHONE_REGEX = re.compile(r"(?:\+?38\s*)?(?:\(0\d{2}\)|0\d{2})[\s-]?\d{3}[\s-]?\d{2}[\s-]?\d{2}")
+ORDER_ID_REGEX = re.compile(r"(?:замовлення|заявка|№|#)\s*(\d{3,8})", re.IGNORECASE)
 
 SESSION_CACHE: Dict[str, dict] = {}
-RATE_LIMIT_CACHE: Dict[str, list] = {}  # session_id -> list of timestamps
+RATE_LIMIT_CACHE: Dict[str, list] = {}
 MAX_REQUESTS_PER_MINUTE = 20
-
 MAX_HISTORY_TURNS = 8
 SESSION_TTL_SECONDS = 14400
 
@@ -37,7 +40,6 @@ RECENT_LOGS: List[dict] = []
 MAX_SAVED_LOGS = 150
 
 async def send_telegram_alert(text: str):
-    """Безпечна відправка сповіщень або замовлень у Telegram"""
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/sendMessage"
@@ -50,7 +52,62 @@ async def send_telegram_alert(text: str):
                 "disable_web_page_preview": True
             })
     except Exception as e:
-        print(f"Помилка надсилання в Telegram: {e}")
+        print(f"Помилка відправки в Telegram: {e}")
+
+async def get_salesdrive_order_status(target: str) -> dict:
+    """Запит до SalesDrive CRM за номером телефону або номером замовлення"""
+    if not SALESDRIVE_DOMAIN or not SALESDRIVE_API_KEY:
+        return {"found": False, "message": "SalesDrive API не налаштовано."}
+
+    clean_digits = re.sub(r"\D", "", target)
+    if not clean_digits:
+        return {"found": False, "message": "Немає даних для пошуку."}
+
+    url = f"https://{SALESDRIVE_DOMAIN}/api/order/list/"
+    headers = {
+        "X-Api-Key": SALESDRIVE_API_KEY,
+        "Content-Type": "application/json"
+    }
+
+    if len(clean_digits) <= 7 and not clean_digits.startswith("0") and not clean_digits.startswith("380"):
+        params = {"filter[id]": clean_digits}
+    else:
+        phone_10 = clean_digits[-10:]
+        params = {"filter[phone]": phone_10}
+
+    try:
+        async with httpx.AsyncClient(timeout=8.0) as client:
+            res = await client.get(url, params=params, headers=headers)
+            if res.status_code == 200:
+                data = res.json()
+                orders = data.get("data", []) or data.get("orders", [])
+                if orders:
+                    latest = orders[0]
+                    order_id = latest.get("id", "")
+                    
+                    status_info = latest.get("status", {})
+                    status_name = status_info.get("text") if isinstance(status_info, dict) else str(status_info or "В обробці")
+
+                    ttn = (
+                        latest.get("trackingNumber") or 
+                        latest.get("ttn") or 
+                        latest.get("ord_delivery_data", {}).get("trackingNumber") or 
+                        ""
+                    )
+                    
+                    order_date = latest.get("orderTime") or latest.get("orderDate") or ""
+
+                    return {
+                        "found": True,
+                        "order_id": order_id,
+                        "status": status_name,
+                        "ttn": ttn,
+                        "date": order_date
+                    }
+            return {"found": False, "message": "Замовлення за вказаними даними не знайдено."}
+    except Exception as e:
+        print(f"Помилка SalesDrive API: {e}")
+        return {"found": False, "message": "Помилка зв'язку з CRM."}
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -63,12 +120,10 @@ async def lifespan(app: FastAPI):
             await catalog.update_feed()
 
             now = time.time()
-            # Очищення застарілих сесій
             expired = [s_id for s_id, data in SESSION_CACHE.items() if now - data.get("last_active", 0) > SESSION_TTL_SECONDS]
             for s_id in expired:
                 SESSION_CACHE.pop(s_id, None)
 
-            # Очищення лічильників спаму
             for s_id in list(RATE_LIMIT_CACHE.keys()):
                 RATE_LIMIT_CACHE[s_id] = [t for t in RATE_LIMIT_CACHE[s_id] if now - t < 60]
                 if not RATE_LIMIT_CACHE[s_id]:
@@ -80,32 +135,43 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ABV Himiya AI Commercial", lifespan=lifespan)
 
+# Захист CORS: дозволяємо запити з магазину та для локальної перевірки
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://abvhimiya.com.ua",
+        "https://www.abvhimiya.com.ua",
+        "*"
+    ],
     allow_credentials=True,
-    allow_methods=["*"],
+    allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
 
 client = genai.Client(api_key=os.getenv("GEMINI_API_KEY"))
 
 SYSTEM_INSTRUCTION = """
-Ти — провідний експерт-технолог інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
-Твоє завдання — професійно консультувати щодо властивостей товарів, прораховувати витрати та допомагати швидко оформити замовлення.
+Ти — провідний технолог-консультант інтернет-магазину будівельної хімії та 3D-друку abvhimiya.com.ua.
 
-ПРАВИЛА ОФОРМЛЕННЯ ВІДПОВІДЕЙ:
-1. Коли рекомендуєш товар, обов'язково додай спеціальний тег картки:
+ПРАВИЛА РЕКОМЕНДАЦІЇ ТОВАРІВ:
+1. Завжди використовуй спеціальний тег для товару:
    [PRODUCT|Назва товару|Ціна|Наявність (В наявності або Під замовлення)|URL|Артикул]
-   Приклад:
-   [PRODUCT|Клей HERCUL E300|245 UAH|В наявності|https://abvhimiya.com.ua/p123|008051]
-2. Текстом стисло поясни, чому саме цей матеріал підходить для завдання клієнта.
-3. ВТРАЧЕНИЙ ПОПИТ (Якщо потрібного товару немає або він "Під замовлення"):
-   - Чесно повідоми про це.
-   - Запропонуй: "Можу підібрати перевірений заводський аналог або зафіксувати замовлення з резервом на складі. Залиште свій номер телефону, і наш технолог проконсультує вас".
-4. Якщо клієнт надсилає номер телефону в чат:
-   - Підтверди, що контакти передано менеджеру, і повідом, що з ним зв'яжуться найближчим часом.
-5. Відповідай виключно українською мовою, конкретно, без зайвої води.
+2. Текстом коротко поясни технічні переваги суміші під завдання користувача.
+
+ПРАВИЛО ДОПРОДАЖУ (CROSS-SELL):
+3. Якщо клієнт запитує фарбу або емаль — коротко нагадай про необхідність ґрунтовки або знежирювача для надійного зчеплення.
+4. Якщо клієнт обирає герметик чи клей у картриджі/тубі — ввічливо запитай, чи потрібен монтажний пістолет або очисник.
+
+ВТРАЧЕНИЙ ПОПИТ:
+5. Якщо товару немає або він "Під замовлення" — запропонуй перевірений заводський аналог або запропонуй залишити телефон для зв'язку з відділом постачання.
+
+ПЕРЕВІРКА СТАТУСУ В SALESDRIVE:
+6. Якщо в запиті є блок "ІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ З SALESDRIVE CRM":
+   - Чітко озвуч номер замовлення №..., поточний статус та ТТН (якщо є).
+   - Якщо ТТН є — нагадай про відстеження в додатку Нової Пошти.
+   - Якщо ТТН немає — підкажи, що замовлення формується на складі та ТТН надійде в SMS.
+7. Якщо замовлення не знайдено — запропонуй перевірити правильність номера телефону чи заявки.
+8. Відповідай українською мовою.
 """
 
 class ChatRequest(BaseModel):
@@ -143,7 +209,6 @@ async def trigger_refresh():
 
 @app.post("/api/quick-order")
 async def quick_order_endpoint(req: QuickOrderRequest):
-    """Пункт 1: Обробка замовлення 'В 1 клік' без переписки"""
     clean_phone = req.phone.strip()
     if not clean_phone or len(re.sub(r"\D", "", clean_phone)) < 9:
         raise HTTPException(status_code=400, detail="Некоректний номер телефону")
@@ -161,142 +226,19 @@ async def quick_order_endpoint(req: QuickOrderRequest):
         f"📦 <b>Товар:</b> {safe_prod}\n"
         f"🏷 <b>Артикул:</b> <code>{safe_code}</code>\n"
         f"💰 <b>Ціна:</b> {safe_price}\n\n"
-        f"🚀 <i>Терміново зв'яжіться для оформлення відправки!</i>"
+        f"🚀 <i>Терміново зв'яжіться для відправки!</i>"
     )
     asyncio.create_task(send_telegram_alert(alert_text))
 
-    # Збереження в журнал
     RECENT_LOGS.insert(0, {
         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         "session_id": req.session_id,
         "user": f"[ШВИДКЕ ЗАМОВЛЕННЯ] {safe_prod} ({safe_phone})",
-        "bot": "Заявку прийнято в 1 клік та надіслано в Telegram менеджеру.",
+        "bot": "Заявку прийнято та надіслано в Telegram.",
         "is_order": True
     })
 
-    return {"status": "success", "message": "Замовлення прийнято! Менеджер скоро зателефонує."}
-
-@app.post("/api/chat", response_model=ChatResponse)
-async def chat_endpoint(req: ChatRequest):
-    user_query = req.message.strip()
-    session_id = req.session_id or "default_user"
-
-    if not user_query:
-        raise HTTPException(status_code=400, detail="Порожнє повідомлення")
-
-    # Пункт 4: Обмеження спаму (Rate Limiting)
-    now = time.time()
-    user_requests = RATE_LIMIT_CACHE.get(session_id, [])
-    user_requests = [t for t in user_requests if now - t < 60]
-    if len(user_requests) >= MAX_REQUESTS_PER_MINUTE:
-        raise HTTPException(status_code=429, detail="Забагато запитів. Зачекайте хвилинку.")
-    user_requests.append(now)
-    RATE_LIMIT_CACHE[session_id] = user_requests
-
-    phone_match = PHONE_REGEX.search(user_query)
-
-    session_data = SESSION_CACHE.get(session_id, {"last_active": time.time(), "history": []})
-    history = session_data["history"]
-
-    search_query = user_query
-    if len(user_query.split()) <= 3 and history:
-        last_user = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
-        search_query = f"{last_user} {user_query}"
-
-    relevant_items = catalog.search_relevant_products(search_query, limit=7)
-
-    catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ ХОРОШОП:\n"
-    if relevant_items:
-        for idx, item in enumerate(relevant_items, 1):
-            avail_str = "В наявності" if item["available"] else "Під замовлення / Немає"
-            catalog_context += (
-                f"{idx}. {item['name']}\n"
-                f"   Артикул: {item.get('vendor_code', item.get('id', ''))}\n"
-                f"   Ціна: {item['price']}\n"
-                f"   Статус: {avail_str}\n"
-                f"   Картка: {item['url']}\n"
-                f"   Параметри: {item.get('params', '')}\n"
-                f"   Опис: {item.get('description', '')}\n\n"
-            )
-    else:
-        catalog_context += "Прямих збігів за ключовими словами не знайдено.\n"
-
-    history_text = ""
-    if history:
-        history_text = "ПОПЕРЕДНІЙ ДІАЛОГ:\n"
-        for h in history[-MAX_HISTORY_TURNS:]:
-            role = "Клієнт" if h["role"] == "user" else "Консультант"
-            history_text += f"{role}: {h['text']}\n"
-        history_text += "\n"
-
-    full_prompt = f"{catalog_context}\n{history_text}Поточне запитання покупця: {user_query}"
-
-    candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
-    response = None
-    last_error = None
-
-    for model_name in candidate_models:
-        try:
-            response = client.models.generate_content(
-                model=model_name,
-                contents=full_prompt,
-                config=types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    temperature=0.2,
-                    max_output_tokens=700,
-                )
-            )
-            if response and response.text:
-                break
-        except Exception as err:
-            last_error = err
-            continue
-
-    if response and response.text:
-        bot_reply = response.text
-
-        history.append({"role": "user", "text": user_query})
-        history.append({"role": "bot", "text": bot_reply})
-        SESSION_CACHE[session_id] = {
-            "last_active": time.time(),
-            "history": history[-MAX_HISTORY_TURNS:]
-        }
-
-        # Фіксація в логах
-        log_entry = {
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "session_id": session_id,
-            "user": user_query,
-            "bot": bot_reply,
-            "is_order": bool(phone_match)
-        }
-        RECENT_LOGS.insert(0, log_entry)
-        if len(RECENT_LOGS) > MAX_SAVED_LOGS:
-            RECENT_LOGS.pop()
-
-        safe_user = html.escape(user_query)
-        safe_bot = html.escape(bot_reply[:350]) + ("..." if len(bot_reply) > 350 else "")
-
-        if phone_match:
-            phone_num = phone_match.group(0).strip()
-            msg = (
-                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З ЧАТУ!</b>\n"
-                f"📞 <b>Телефон:</b> <code>{html.escape(phone_num)}</code>\n"
-                f"👤 <b>Клієнт:</b> {safe_user}\n"
-                f"🤖 <b>Бот:</b> {safe_bot}"
-            )
-        else:
-            msg = (
-                f"💬 <b>Нове повідомлення в чаті</b>\n"
-                f"🔑 <b>Сесія:</b> <code>{html.escape(session_id)}</code>\n"
-                f"👤 <b>Клієнт:</b> {safe_user}\n"
-                f"🤖 <b>Бот:</b> {safe_bot}"
-            )
-        asyncio.create_task(send_telegram_alert(msg))
-
-        return ChatResponse(reply=bot_reply)
-    else:
-        return ChatResponse(reply=f"Сервіс оновлює дані каталогу. Помилка: {str(last_error)}")
+    return {"status": "success", "message": "Замовлення прийнято!"}
 
 @app.get("/admin/logs", response_class=HTMLResponse)
 def view_logs(secret: str = Query(..., description="Ключ доступу")):
@@ -350,6 +292,151 @@ def view_logs(secret: str = Query(..., description="Ключ доступу")):
     </html>
     """
 
+@app.post("/api/chat", response_model=ChatResponse)
+async def chat_endpoint(req: ChatRequest):
+    user_query = req.message.strip()
+    session_id = req.session_id or "default_user"
+
+    if not user_query:
+        raise HTTPException(status_code=400, detail="Порожнє повідомлення")
+
+    now = time.time()
+    user_requests = RATE_LIMIT_CACHE.get(session_id, [])
+    user_requests = [t for t in user_requests if now - t < 60]
+    if len(user_requests) >= MAX_REQUESTS_PER_MINUTE:
+        raise HTTPException(status_code=429, detail="Забагато запитів. Зачекайте хвилину.")
+    user_requests.append(now)
+    RATE_LIMIT_CACHE[session_id] = user_requests
+
+    phone_match = PHONE_REGEX.search(user_query)
+    order_id_match = ORDER_ID_REGEX.search(user_query)
+
+    status_keywords = ["статус", "де замовлення", "відправк", "посилк", "де посилка", "номер заявки", "номер замовлення", "де мій", "коли приїде", "ттн"]
+    is_status_query = any(k in user_query.lower() for k in status_keywords)
+
+    crm_context = ""
+    if is_status_query or order_id_match:
+        search_target = ""
+        if order_id_match:
+            search_target = order_id_match.group(1)
+        elif phone_match:
+            search_target = phone_match.group(0)
+
+        if search_target:
+            order_data = await get_salesdrive_order_status(search_target)
+            if order_data.get("found"):
+                crm_context = (
+                    f"\nІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ З SALESDRIVE CRM:\n"
+                    f"- Номер замовлення: №{order_data['order_id']}\n"
+                    f"- Поточний статус: {order_data['status']}\n"
+                    f"- Номер ТТН: {order_data['ttn'] if order_data['ttn'] else 'Ще не сформовано'}\n"
+                    f"- Дата замовлення: {order_data.get('date', 'Сьогодні')}\n"
+                )
+            else:
+                crm_context = f"\nІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ: За номером '{search_target}' замовлення в SalesDrive не знайдено.\n"
+
+    session_data = SESSION_CACHE.get(session_id, {"last_active": time.time(), "history": []})
+    history = session_data["history"]
+
+    search_query = user_query
+    if len(user_query.split()) <= 3 and history:
+        last_user = next((h["text"] for h in reversed(history) if h["role"] == "user"), "")
+        search_query = f"{last_user} {user_query}"
+
+    relevant_items = catalog.search_relevant_products(search_query, limit=5)
+
+    catalog_context = "АКТУАЛЬНІ ТОВАРИ В КАТАЛОЗІ:\n"
+    if relevant_items and not is_status_query:
+        for idx, item in enumerate(relevant_items, 1):
+            avail_str = "В наявності" if item["available"] else "Під замовлення / Немає"
+            catalog_context += (
+                f"{idx}. {item['name']}\n"
+                f"   Артикул: {item.get('vendor_code', item.get('id', ''))}\n"
+                f"   Ціна: {item['price']}\n"
+                f"   Статус: {avail_str}\n"
+                f"   Картка: {item['url']}\n"
+                f"   Опис: {item.get('description', '')}\n\n"
+            )
+    else:
+        catalog_context += "Прямих товарних запитів не виявлено.\n"
+
+    history_text = ""
+    if history:
+        history_text = "ПОПЕРЕДНІЙ ДІАЛОГ:\n"
+        for h in history[-MAX_HISTORY_TURNS:]:
+            role = "Клієнт" if h["role"] == "user" else "Консультант"
+            history_text += f"{role}: {h['text']}\n"
+        history_text += "\n"
+
+    full_prompt = f"{catalog_context}\n{crm_context}\n{history_text}Поточне запитання покупця: {user_query}"
+
+    candidate_models = ["gemini-3.5-flash-lite", "gemini-3.8-flash"]
+    response = None
+    last_error = None
+
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=full_prompt,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM_INSTRUCTION,
+                    temperature=0.2,
+                    max_output_tokens=650,
+                )
+            )
+            if response and response.text:
+                break
+        except Exception as err:
+            last_error = err
+            continue
+
+    if response and response.text:
+        bot_reply = response.text
+
+        history.append({"role": "user", "text": user_query})
+        history.append({"role": "bot", "text": bot_reply})
+        SESSION_CACHE[session_id] = {
+            "last_active": time.time(),
+            "history": history[-MAX_HISTORY_TURNS:]
+        }
+
+        is_order_intent = bool(phone_match and not is_status_query)
+
+        log_entry = {
+            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "session_id": session_id,
+            "user": user_query,
+            "bot": bot_reply,
+            "is_order": is_order_intent
+        }
+        RECENT_LOGS.insert(0, log_entry)
+        if len(RECENT_LOGS) > MAX_SAVED_LOGS:
+            RECENT_LOGS.pop()
+
+        safe_user = html.escape(user_query)
+        safe_bot = html.escape(bot_reply[:350]) + ("..." if len(bot_reply) > 350 else "")
+
+        if is_order_intent:
+            phone_num = phone_match.group(0).strip()
+            msg = (
+                f"🚨 <b>НОВЕ ЗАМОВЛЕННЯ З ЧАТУ!</b>\n\n"
+                f"📞 <b>Телефон:</b> <code>{html.escape(phone_num)}</code>\n"
+                f"👤 <b>Клієнт:</b> {safe_user}\n"
+                f"🤖 <b>Бот:</b> {safe_bot}"
+            )
+        else:
+            msg = (
+                f"💬 <b>Нове повідомлення в чаті</b>\n"
+                f"👤 <b>Клієнт:</b> {safe_user}\n"
+                f"🤖 <b>Бот:</b> {safe_bot}"
+            )
+        asyncio.create_task(send_telegram_alert(msg))
+
+        return ChatResponse(reply=bot_reply)
+    else:
+        return ChatResponse(reply=f"Сервіс оновлює каталог. Помилка: {str(last_error)}")
+
 @app.get("/widget", response_class=HTMLResponse)
 def get_widget_page():
     return """
@@ -361,8 +448,28 @@ def get_widget_page():
         <title>Онлайн-консультант ABV Himiya</title>
         <style>
             body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; padding: 20px; background: #f8fafc; }
+            
+            /* Проактивна підказка-хмарка */
+            #ai-proactive-bubble {
+                position: fixed; bottom: 155px; right: 25px;
+                background: #ffffff; color: #0f172a; padding: 10px 14px;
+                border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,0.14);
+                font-size: 13px; font-weight: 500; z-index: 999998;
+                display: none; cursor: pointer; border: 1px solid #e2e8f0;
+                animation: popIn 0.3s ease;
+            }
+            #ai-proactive-bubble::after {
+                content: ''; position: absolute; bottom: -8px; right: 25px;
+                width: 0; height: 0; border-left: 8px solid transparent;
+                border-right: 8px solid transparent; border-top: 8px solid #ffffff;
+            }
+            @keyframes popIn {
+                from { opacity: 0; transform: translateY(10px); }
+                to { opacity: 1; transform: translateY(0); }
+            }
+
             #ai-chat-launcher {
-                position: fixed; bottom: 25px; right: 25px;
+                position: fixed; bottom: 85px; right: 25px;
                 background: #0284c7; color: #fff; border-radius: 50%;
                 width: 60px; height: 60px; display: flex;
                 align-items: center; justify-content: center;
@@ -372,8 +479,8 @@ def get_widget_page():
             }
             #ai-chat-launcher:hover { transform: scale(1.08); }
             #ai-chat-window {
-                position: fixed; bottom: 95px; right: 25px;
-                width: 400px; max-width: calc(100vw - 30px); height: 580px; max-height: calc(100vh - 120px);
+                position: fixed; bottom: 155px; right: 25px;
+                width: 400px; max-width: calc(100vw - 30px); height: 580px; max-height: calc(100vh - 180px);
                 background: #ffffff; border-radius: 16px; box-shadow: 0 12px 35px rgba(0,0,0,0.18);
                 display: none; flex-direction: column; overflow: hidden;
                 font-family: inherit; z-index: 999999; border: 1px solid #e2e8f0;
@@ -390,7 +497,17 @@ def get_widget_page():
             .msg.user { background: #0284c7; color: #ffffff; margin-left: auto; border-bottom-right-radius: 2px; }
             .msg.bot { background: #ffffff; color: #1e293b; margin-right: auto; border-bottom-left-radius: 2px; box-shadow: 0 1px 4px rgba(0,0,0,0.06); border: 1px solid #e2e8f0; }
 
-            /* Вітрина товарів у чаті */
+            /* Швидкі сценарії (Chips) */
+            .quick-chips-box {
+                display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0 12px 0;
+            }
+            .quick-chip {
+                background: #f0f9ff; color: #0284c7; border: 1px solid #bae6fd;
+                padding: 5px 10px; border-radius: 14px; font-size: 11.5px;
+                cursor: pointer; font-weight: 600; transition: background 0.15s;
+            }
+            .quick-chip:hover { background: #e0f2fe; }
+
             .prod-card {
                 background: #ffffff; border: 1px solid #e2e8f0; border-radius: 10px;
                 padding: 12px; margin: 10px 0; box-shadow: 0 2px 6px rgba(0,0,0,0.04);
@@ -409,26 +526,17 @@ def get_widget_page():
                 flex: 1.2; background: #0284c7; color: #ffffff; border: none; border-radius: 6px;
                 padding: 6px 8px; font-size: 12px; font-weight: 600; cursor: pointer; text-align: center;
             }
-            .btn-order-fast:hover { background: #0369a1; }
-
             #ai-chat-input-box { display: flex; border-top: 1px solid #e2e8f0; background: #ffffff; padding: 6px; }
             #ai-chat-input { flex: 1; border: none; padding: 10px 12px; outline: none; font-size: 13.5px; }
             #ai-chat-send { background: #0284c7; color: #ffffff; border: none; padding: 0 16px; cursor: pointer; font-weight: 600; border-radius: 8px; }
 
-            /* Модальне вікно замовлення в 1 клік */
             #fast-order-modal {
                 display: none; position: absolute; inset: 0; background: rgba(15, 23, 42, 0.6);
                 z-index: 1000000; align-items: center; justify-content: center; padding: 16px;
             }
-            .modal-content {
-                background: #ffffff; border-radius: 12px; padding: 18px; width: 100%; max-width: 310px;
-                box-shadow: 0 10px 25px rgba(0,0,0,0.2);
-            }
+            .modal-content { background: #ffffff; border-radius: 12px; padding: 18px; width: 100%; max-width: 310px; }
             .modal-title { font-weight: 700; margin-bottom: 8px; font-size: 15px; color: #0f172a; }
-            .modal-input {
-                width: 100%; box-sizing: border-box; padding: 9px 12px; border: 1px solid #cbd5e1;
-                border-radius: 6px; margin-bottom: 8px; font-size: 13px; outline: none;
-            }
+            .modal-input { width: 100%; box-sizing: border-box; padding: 9px 12px; border: 1px solid #cbd5e1; border-radius: 6px; margin-bottom: 8px; font-size: 13px; outline: none; }
             .modal-btns { display: flex; gap: 8px; margin-top: 10px; }
             .btn-submit { flex: 1; background: #0284c7; color: #fff; border: none; padding: 8px; border-radius: 6px; font-weight: 600; cursor: pointer; }
             .btn-cancel { background: #f1f5f9; color: #64748b; border: none; padding: 8px 12px; border-radius: 6px; cursor: pointer; }
@@ -436,8 +544,8 @@ def get_widget_page():
     </head>
     <body>
         <h2>Онлайн-консультант ABV Himiya</h2>
-        <p>Клікніть на синю іконку 💬 у нижньому правому кутку.</p>
 
+        <div id="ai-proactive-bubble" onclick="openChatFromBubble()">Підказати сумісність клею чи витрату на площу? 👋</div>
         <div id="ai-chat-launcher" onclick="toggleAIChat()">💬</div>
 
         <div id="ai-chat-window">
@@ -450,15 +558,21 @@ def get_widget_page():
             </div>
             
             <div id="ai-chat-messages">
-                <div class="msg bot">Вітаю! Чим можу допомогти щодо вибору клеїв, герметиків, фарб чи пластику для 3D-друку?</div>
+                <div class="msg bot">Вітаю! Чим можу допомогти? Підкажу щодо вибору будівельної хімії чи перевірю статус вашого замовлення!</div>
+                <div class="quick-chips-box">
+                    <span class="quick-chip" onclick="handleChipClick('Де моє замовлення?')">📦 Де моє замовлення?</span>
+                    <span class="quick-chip" onclick="handleChipClick('Фарба для ванни є?')">🛁 Фарба для ванни</span>
+                    <span class="quick-chip" onclick="handleChipClick('Порадь епоксидний клей для металу')">🧪 Епоксидний клей</span>
+                    <span class="quick-chip" onclick="handleChipClick('Який філамент PLA є в наявності?')">🧵 Пластик для 3D</span>
+                    <span class="quick-chip" onclick="handleChipClick('Як звʼязатися з менеджером?')">📞 Менеджер</span>
+                </div>
             </div>
 
             <div id="ai-chat-input-box">
-                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар чи властивості..." onkeydown="if(event.key==='Enter') sendAIMsg()">
+                <input type="text" id="ai-chat-input" placeholder="Запитайте про товар або введіть номер замовлення..." onkeydown="if(event.key==='Enter') sendAIMsg()">
                 <button id="ai-chat-send" onclick="sendAIMsg()">➤</button>
             </div>
 
-            <!-- Спливаюче вікно для швидкого замовлення -->
             <div id="fast-order-modal">
                 <div class="modal-content">
                     <div class="modal-title">⚡ Швидке замовлення</div>
@@ -482,121 +596,6 @@ def get_widget_page():
 
             let currentOrderData = null;
 
-            function toggleAIChat() {
+            // Проактивне привітання через 12 секунд
+            setTimeout(() => {
                 const win = document.getElementById("ai-chat-window");
-                win.style.display = (win.style.display === "flex") ? "none" : "flex";
-                if (win.style.display === "flex") {
-                    document.getElementById("ai-chat-input").focus();
-                }
-            }
-
-            function openOrderModal(name, price, code) {
-                currentOrderData = { name, price, code };
-                document.getElementById("modal-product-name").innerText = `${name} — ${price}`;
-                document.getElementById("fast-order-modal").style.display = "flex";
-            }
-
-            function closeOrderModal() {
-                document.getElementById("fast-order-modal").style.display = "none";
-            }
-
-            async function submitQuickOrder() {
-                const name = document.getElementById("fast-name").value.trim();
-                const phone = document.getElementById("fast-phone").value.trim();
-                if (!phone) {
-                    alert("Будь ласка, вкажіть контактний номер телефону!");
-                    return;
-                }
-
-                try {
-                    const res = await fetch("/api/quick-order", {
-                        method: "POST",
-                        headers: {"Content-Type": "application/json"},
-                        body: JSON.stringify({
-                            name: name,
-                            phone: phone,
-                            product_name: currentOrderData.name,
-                            product_price: currentOrderData.price,
-                            product_code: currentOrderData.code,
-                            session_id: sessionId
-                        })
-                    });
-                    const data = await res.json();
-                    closeOrderModal();
-
-                    const box = document.getElementById("ai-chat-messages");
-                    box.innerHTML += `<div class="msg bot" style="border-left: 3px solid #16a34a;"><b>Дякуємо, ${escapeHtml(name || 'клієнте')}!</b> Заявку на <b>${escapeHtml(currentOrderData.name)}</b> прийнято в обробку. Менеджер зателефонує вам на номер ${escapeHtml(phone)}!</div>`;
-                    box.scrollTop = box.scrollHeight;
-                } catch(e) {
-                    alert("Помилка відправки замовлення. Спробуйте пізніше.");
-                }
-            }
-
-            async function sendAIMsg() {
-                const inp = document.getElementById("ai-chat-input");
-                const text = inp.value.trim();
-                if (!text) return;
-
-                const box = document.getElementById("ai-chat-messages");
-                box.innerHTML += `<div class="msg user">${escapeHtml(text)}</div>`;
-                inp.value = "";
-                box.scrollTop = box.scrollHeight;
-
-                const botId = "ai-bot-" + Date.now();
-                box.innerHTML += `<div class="msg bot" id="${botId}"><i>Секунду, аналізую каталог...</i></div>`;
-                box.scrollTop = box.scrollHeight;
-
-                try {
-                    const res = await fetch("/api/chat", {
-                        method: "POST",
-                        headers: {"Content-Type": "application/json"},
-                        body: JSON.stringify({ message: text, session_id: sessionId })
-                    });
-                    if (res.status === 429) {
-                        document.getElementById(botId).innerText = "Забагато повідомлень. Будь ласка, зачекайте хвилину.";
-                        return;
-                    }
-                    const data = await res.json();
-
-                    let raw = data.reply;
-
-                    // Парсинг тегів [PRODUCT|...] у стильні вітрини
-                    raw = raw.replace(/\\[PRODUCT\\|(.*?)\\|(.*?)\\|(.*?)\\|(.*?)\\|(.*?)\\]/g, function(match, pName, pPrice, pAvail, pUrl, pCode) {
-                        const isAvail = pAvail.includes("наявності");
-                        const badgeClass = isAvail ? "badge-instock" : "badge-outstock";
-                        const badgeText = isAvail ? "🟢 В наявності" : "🟡 Під замовлення";
-
-                        return `
-                        <div class="prod-card">
-                            <div class="prod-title">${escapeHtml(pName)}</div>
-                            <div class="prod-meta">
-                                <span class="prod-price">${escapeHtml(pPrice)}</span>
-                                <span class="${badgeClass}">${badgeText}</span>
-                            </div>
-                            <div class="prod-actions">
-                                <a href="${escapeHtml(pUrl)}" target="_blank" class="btn-view">Картка ↗</a>
-                                <button class="btn-order-fast" onclick="openOrderModal('${escapeHtml(pName).replace(/'/g, "\\\\'")}', '${escapeHtml(pPrice)}', '${escapeHtml(pCode)}')">⚡ В 1 клік</button>
-                            </div>
-                        </div>`;
-                    });
-
-                    // Звичайне форматування для решти тексту
-                    let formatted = raw
-                        .replace(/\\[(.*?)\\]\\((https?:\\/\\/.*?)\\)/g, '<a href="$2" target="_blank">$1 ↗</a>')
-                        .replace(/\\*\\*(.*?)\\*\\*/g, '<b>$1</b>')
-                        .replace(/\\n/g, "<br>");
-
-                    document.getElementById(botId).innerHTML = formatted;
-                } catch (e) {
-                    document.getElementById(botId).innerText = "Помилка зв'язку з сервером.";
-                }
-                box.scrollTop = box.scrollHeight;
-            }
-
-            function escapeHtml(s) {
-                return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-            }
-        </script>
-    </body>
-    </html>
-    """
