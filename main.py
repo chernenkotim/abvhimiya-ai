@@ -39,7 +39,7 @@ SESSION_TTL_SECONDS = 14400
 RECENT_LOGS: List[dict] = []
 MAX_SAVED_LOGS = 150
 
-# Базові статуси замовлень SalesDrive
+# Базові назви статусів SalesDrive
 SALESDRIVE_STATUSES = {
     1: "Нова заявка",
     2: "В обробці",
@@ -66,7 +66,11 @@ async def send_telegram_alert(text: str):
         print(f"Помилка відправки в Telegram: {e}")
 
 async def get_salesdrive_order_status(target: str) -> dict:
-    """Точний запит до SalesDrive CRM через офіційні параметри idFrom / idTo"""
+    """
+    Пошук замовлення в SalesDrive:
+    1) Шукає за 'Зовнішній номер заявки' (externalId) — номер із Хорошопу
+    2) Якщо не знайдено — шукає за внутрішнім ID або телефоном
+    """
     if not SALESDRIVE_DOMAIN or not SALESDRIVE_API_KEY:
         print("[SalesDrive] ПОМИЛКА: Не вказано SALESDRIVE_DOMAIN або SALESDRIVE_API_KEY в Environment!")
         return {"found": False, "message": "SalesDrive API не налаштовано."}
@@ -81,80 +85,81 @@ async def get_salesdrive_order_status(target: str) -> dict:
         "Accept": "application/json"
     }
 
-    # Для пошуку за номером заявки (4-8 цифр) SalesDrive вимагає діапазон idFrom / idTo
-    if len(clean_digits) <= 8 and not clean_digits.startswith("0") and not clean_digits.startswith("380"):
-        params = {
-            "idFrom": int(clean_digits),
-            "idTo": int(clean_digits)
-        }
-    else:
-        # Пошук за телефоном
-        phone_10 = clean_digits[-10:]
-        params = {"phone": phone_10}
+    # Визначаємо, чи це номер замовлення (до 8 цифр і не починається на 0/380)
+    is_order_number = len(clean_digits) <= 8 and not clean_digits.startswith("0") and not clean_digits.startswith("380")
 
-    print(f"[SalesDrive] Запит до: {url} з параметрами: {params}")
+    param_variants = []
+    if is_order_number:
+        # Пріоритет 1: Пошук за Зовнішнім номером заявки (Хорошоп)
+        param_variants.append({"filter[externalId]": clean_digits, "externalId": clean_digits})
+        # Пріоритет 2: Пошук за внутрішнім idFrom/idTo
+        param_variants.append({"idFrom": int(clean_digits), "idTo": int(clean_digits)})
+    else:
+        # Пошук за номером телефону
+        phone_10 = clean_digits[-10:]
+        param_variants.append({"filter[phone]": phone_10, "phone": phone_10})
+        param_variants.append({"filter[primaryPhone]": phone_10})
 
     try:
         async with httpx.AsyncClient(timeout=9.0, follow_redirects=True) as client:
-            res = await client.get(url, params=params, headers=headers)
-            print(f"[SalesDrive] Відповідь сервера: {res.status_code}")
+            for params in param_variants:
+                print(f"[SalesDrive] Пробуємо запит: {url} з {params}")
+                res = await client.get(url, params=params, headers=headers)
+                print(f"[SalesDrive] Відповідь: {res.status_code}")
 
-            if res.status_code == 200:
-                data = res.json()
-                orders = data.get("data", []) or data.get("orders", [])
+                if res.status_code == 200:
+                    data = res.json()
+                    orders = data.get("data", []) or data.get("orders", [])
 
-                matched = None
-                if orders:
-                    for ord_item in orders:
-                        if str(ord_item.get("id")) == clean_digits:
-                            matched = ord_item
-                            break
-                    if not matched:
-                        matched = orders[0]
+                    matched = None
+                    if orders:
+                        for ord_item in orders:
+                            ext_id = str(ord_item.get("externalId", ""))
+                            internal_id = str(ord_item.get("id", ""))
+                            if ext_id == clean_digits or internal_id == clean_digits:
+                                matched = ord_item
+                                break
+                        if not matched and not is_order_number:
+                            matched = orders[0]  # для пошуку за телефоном беремо останнє
 
-                if matched:
-                    order_id = matched.get("id", clean_digits)
+                    if matched:
+                        # Відображаємо клієнту його звичний номер
+                        display_order_id = matched.get("externalId") or matched.get("id", clean_digits)
 
-                    # Статус замовлення
-                    status_name = "В обробці"
-                    if matched.get("status"):
-                        st = matched.get("status")
-                        status_name = st.get("text") if isinstance(st, dict) else str(st)
-                    elif matched.get("statusText"):
-                        status_name = matched.get("statusText")
-                    elif matched.get("statusId") and matched.get("statusId") in SALESDRIVE_STATUSES:
-                        status_name = SALESDRIVE_STATUSES[matched["statusId"]]
+                        # Статус
+                        status_name = "В обробці"
+                        if matched.get("status"):
+                            st = matched.get("status")
+                            status_name = st.get("text") if isinstance(st, dict) else str(st)
+                        elif matched.get("statusText"):
+                            status_name = matched.get("statusText")
+                        elif matched.get("statusId") and matched.get("statusId") in SALESDRIVE_STATUSES:
+                            status_name = SALESDRIVE_STATUSES[matched["statusId"]]
 
-                    # ТТН Нової Пошти / Укрпошти
-                    ttn = (
-                        matched.get("trackingNumber") or
-                        matched.get("ttn") or
-                        matched.get("ord_delivery_data", {}).get("trackingNumber") or
-                        ""
-                    )
+                        # ТТН Нової Пошти / Укрпошти
+                        ttn = (
+                            matched.get("trackingNumber") or
+                            matched.get("ttn") or
+                            matched.get("ord_delivery_data", {}).get("trackingNumber") or
+                            ""
+                        )
 
-                    # Дата оформлення
-                    order_date = matched.get("orderTime") or matched.get("orderDate") or ""
-                    if order_date and "T" in str(order_date):
-                        order_date = str(order_date).split("T")[0]
+                        order_date = matched.get("orderTime") or matched.get("orderDate") or ""
+                        if order_date and "T" in str(order_date):
+                            order_date = str(order_date).split("T")[0]
 
-                    print(f"[SalesDrive] ЗНАЙДЕНО замовлення №{order_id}: статус '{status_name}', ТТН: '{ttn}'")
-
-                    return {
-                        "found": True,
-                        "order_id": order_id,
-                        "status": status_name,
-                        "ttn": ttn,
-                        "date": order_date
-                    }
-                else:
-                    print(f"[SalesDrive] Список data порожній для номера {clean_digits}")
-            else:
-                print(f"[SalesDrive] Помилка API {res.status_code}: {res.text}")
+                        print(f"[SalesDrive] УСПІХ! Замовлення №{display_order_id}: статус '{status_name}', ТТН: '{ttn}'")
+                        return {
+                            "found": True,
+                            "order_id": display_order_id,
+                            "status": status_name,
+                            "ttn": ttn,
+                            "date": order_date
+                        }
 
             return {"found": False, "message": "Замовлення за вказаними даними не знайдено."}
     except Exception as e:
-        print(f"[SalesDrive] Виняток: {e}")
+        print(f"[SalesDrive] Помилка з'єднання: {e}")
         return {"found": False, "message": f"Помилка зв'язку з CRM: {e}"}
 
 @asynccontextmanager
@@ -202,20 +207,20 @@ SYSTEM_INSTRUCTION = """
 
 ПРАВИЛА НАДАННЯ СТАТУСУ ЗАМОВЛЕНЬ (SalesDrive):
 1. Якщо в контексті є блок "ІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ З SALESDRIVE CRM":
-   - НЕ ПРОСИ НОМЕР ТЕЛЕФОНУ! Вся інформація вже перед тобою.
+   - НЕ ПРОСИ НОМЕР ТЕЛЕФОНУ ЧИ ІНШІ ДАНІ! Всі дані знайдено.
    - Одразу і чітко напиши клієнту:
      • Номер замовлення: №...
      • Актуальний статус: ...
-     • Номер ТТН: (якщо є ТТН — обов'язково напиши номер накладної та нагадай про відстеження в додатку Нової Пошти; якщо ТТН ще немає — зазнач, що замовлення готується до відправки зі складу).
-2. Якщо клієнт питає "як дізнатись статус замовлення" або "який статус замовлення", але не вказав номер:
-   - Ввічливо напиши: "Будь ласка, вкажіть номер вашого замовлення (наприклад: 19138) або контактний номер телефону, і я миттєво перевірю інформацію в системі!"
+     • Номер ТТН: (якщо є ТТН — чітко напиши номер накладної та нагадай, що відстежити посилку можна у додатку Нової Пошти; якщо ТТН ще немає — поясни, що замовлення формується на складі і ТТН надійде в SMS одразу після передачі перевізнику).
+2. Якщо клієнт запитує "де замовлення" або "який статус", але не надав номер:
+   - Ввічливо попроси вказати номер замовлення з сайту (наприклад, 19138) або номер телефону.
 3. Якщо замовлення не знайдено:
-   - Напиши, що замовлення за цим номером не знайдено в базі, та запропонуй уточнити номер або зв'язатися з менеджером.
+   - Ввічливо поясни, що за номером замовлення не знайдено, і запропонуй перевірити номер або звернутися до менеджера.
 
 ПРАВИЛА РОБОТИ З ТОВАРАМИ:
 4. Якщо рекомендуєш товар, використовуй тег:
    [PRODUCT|Назва товару|Ціна|Наявність (В наявності або Під замовлення)|URL|Артикул]
-5. Завжди відповідай українською мовою.
+5. Завжди відповідай виключно українською мовою.
 """
 
 class ChatRequest(BaseModel):
@@ -344,6 +349,7 @@ async def chat_endpoint(req: ChatRequest):
     if not user_query:
         raise HTTPException(status_code=400, detail="Порожнє повідомлення")
 
+    # Обмеження частоти запитів
     now = time.time()
     user_requests = RATE_LIMIT_CACHE.get(session_id, [])
     user_requests = [t for t in user_requests if now - t < 60]
@@ -355,7 +361,7 @@ async def chat_endpoint(req: ChatRequest):
     session_data = SESSION_CACHE.get(session_id, {"last_active": time.time(), "history": []})
     history = session_data["history"]
 
-    # 1. Пошук номера в поточному або попередньому повідомленні
+    # 1. Пошук номера замовлення або номера телефону
     phone_match = PHONE_REGEX.search(user_query)
     order_id_match = ORDER_ID_REGEX.search(user_query)
 
@@ -365,11 +371,15 @@ async def chat_endpoint(req: ChatRequest):
     elif phone_match:
         search_target = phone_match.group(0)
     elif any(k in user_query.lower() for k in ["статус", "де замовленн", "що з", "де посилк"]):
-        # Перевіряємо історію, якщо номер назвали крок тому
+        # Якщо в поточному повідомленні немає номера, перевіряємо останні репліки діалогу
         for prev in reversed(history[-2:]):
             prev_order = ORDER_ID_REGEX.search(prev["text"])
             if prev_order:
                 search_target = prev_order.group(1)
+                break
+            prev_phone = PHONE_REGEX.search(prev["text"])
+            if prev_phone:
+                search_target = prev_phone.group(0)
                 break
 
     crm_context = ""
@@ -378,15 +388,15 @@ async def chat_endpoint(req: ChatRequest):
         if order_data.get("found"):
             crm_context = (
                 f"\nІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ З SALESDRIVE CRM:\n"
-                f"- Номер замовлення: №{order_data['order_id']}\n"
+                f"- Зовнішній номер замовлення (з сайту): №{order_data['order_id']}\n"
                 f"- Поточний статус: {order_data['status']}\n"
-                f"- Номер ТТН: {order_data['ttn'] if order_data['ttn'] else 'Ще не сформовано'}\n"
-                f"- Дата замовлення: {order_data.get('date', 'Сьогодні')}\n"
+                f"- Номер ТТН: {order_data['ttn'] if order_data['ttn'] else 'Ще не сформовано (готується на складі)'}\n"
+                f"- Дата оформлення: {order_data.get('date', 'Сьогодні')}\n"
             )
         else:
             crm_context = f"\nІНФОРМАЦІЯ ПРО ЗАМОВЛЕННЯ: За номером '{search_target}' замовлення в SalesDrive не знайдено.\n"
 
-    # 2. Пошук товарів у каталозі Хорошоп (якщо це не статусний запит)
+    # 2. Пошук товарів у каталозі (тільки якщо це не запит щодо статусу)
     relevant_items = []
     is_status_query = any(k in user_query.lower() for k in ["статус", "де замовленн", "що з", "відправк", "посилк", "де посилк", "ттн"]) or bool(search_target)
 
