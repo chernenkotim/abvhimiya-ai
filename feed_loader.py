@@ -1,258 +1,98 @@
-import os
+"""Read-only catalog adapter. Supply a Horoshop/YML export or local JSON.
+Never uses LLM as authoritative price/stock source.
+"""
+import asyncio
+import json
+import logging
 import re
-import time
+from pathlib import Path
+from urllib.parse import urlparse
+from xml.etree import ElementTree as ET
 import httpx
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
+from defusedxml import ElementTree as SafeET
 
-load_dotenv()
+log = logging.getLogger(__name__)
 
-HOROSHOP_FEED_URL = os.getenv("HOROSHOP_FEED_URL", "")
+def _text(node, name, default=''):
+    x = node.find(name)
+    return (x.text or '').strip() if x is not None else default
 
-EN_TO_UA_KEYBOARD = str.maketrans(
-    "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~",
-    "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
-)
+def _available(v):
+    return str(v).lower() in ('true','1','yes','available','в наявності')
 
-# Двосторонній індекс синонімів із врахуванням ванн, сантехніки та реставрації
-BASE_SYNONYMS = [
-    {"ванна", "ванни", "ванн", "вани", "кераміка", "ceramic", "сантехніка", "реставрація"},
-    {"клей", "glue", "adhesive", "kleber", "епоксид", "епоксидний", "epoxy"},
-    {"герметик", "sealant", "silicone", "силікон", "акрил", "силіконовий"},
-    {"грунтовка", "грунт", "ґрунтовка", "ґрунт", "primer"},
-    {"фарба", "paint", "емаль", "колор", "краска", "аерозоль", "балончик"},
-    {"піна", "foam", "монтажна піна"},
-    {"філамент", "filament", "пластик", "pla", "petg", "abs"},
-    {"гідроізоляція", "waterproof", "waterproofing", "гідробар'єр"},
-    {"очисник", "cleaner", "змивка", "розчинник", "solvent", "thinner"}
-]
+def _normalize(raw):
+    if not isinstance(raw, dict): return None
+    product_id = str(raw.get('id') or raw.get('product_id') or raw.get('vendor_code') or '').strip()
+    name = str(raw.get('name') or raw.get('title') or '').strip()
+    url = str(raw.get('url') or raw.get('link') or '').strip()
+    if not product_id or not name or not url.startswith('https://'): return None
+    host = (urlparse(url).hostname or '').lower()
+    if host not in {'abvhimiya.com.ua', 'www.abvhimiya.com.ua','sunlu.kyiv.ua','www.sunlu.kyiv.ua'}: return None
+    try:
+        price = float(str(raw.get('price', '')).replace(' ', '').replace(',', '.'))
+        if not (0 < price < 1e8): return None
+    except (ValueError,TypeError): return None
+    return {'id':product_id, 'name':name[:250], 'vendor_code':str(raw.get('vendor_code') or raw.get('sku') or product_id)[:80],
+            'price':round(price,2), 'available':_available(raw.get('available',False)) if not isinstance(raw.get('available'),bool) else raw['available'],
+            'url':url,'description':re.sub('<[^>]+>',' ',str(raw.get('description') or ''))[:1500]}
 
-SYNONYMS_INDEX = {}
-for group in BASE_SYNONYMS:
-    for word in group:
-        SYNONYMS_INDEX[word] = group
-
-HTML_TAG_CLEANER = re.compile(r"<[^>]+>")
-
-def clean_html(raw_html: str) -> str:
-    if not raw_html:
-        return ""
-    text = HTML_TAG_CLEANER.sub(" ", raw_html)
-    return " ".join(text.split())
-
-def fix_keyboard_layout(text: str) -> str:
-    if re.fullmatch(r"[a-zA-Z0-9\s\.,'ʼ\-\/]+", text):
-        converted = text.translate(EN_TO_UA_KEYBOARD)
-        if re.search(r"[а-яіїєґ]{3,}", converted, re.IGNORECASE):
-            return converted
-    return text
-
-def normalize_stem(word: str) -> str:
-    w = word.lower().strip()
-    # Прибираємо випадкові подвоєння приголосних (ванна -> вана, ванни -> вани)
-    w = re.sub(r'(.)\1+', r'\1', w)
-    endings = ["ного", "ному", "ним", "ний", "ою", "ям", "ем", "ом", "ий", "их", "им", "ів", "на", "не", "ні", "а", "е", "у", "і", "и"]
-    for end in sorted(endings, key=len, reverse=True):
-        if len(w) > len(end) + 2 and w.endswith(end):
-            return w[:-len(end)]
-    return w
-
-class CatalogManager:
-    def __init__(self, feed_url: str):
-        self.feed_url = feed_url
+class Catalog:
+    def __init__(self):
         self.products = []
-        self.last_updated = 0
+        self.by_id = {}
+        self.last_updated = None
+        self._lock = asyncio.Lock()
+        self.loaded = False
 
-    async def update_feed(self):
-        if not self.feed_url:
-            print("ПОМИЛКА: Не вказано HOROSHOP_FEED_URL")
-            return
-
-        separator = "&" if "?" in self.feed_url else "?"
-        fresh_url = f"{self.feed_url}{separator}_t={int(time.time())}"
-
-        print(f"Завантаження та швидка індексація каталогу: {self.feed_url}")
-        try:
-            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
-            async with httpx.AsyncClient(timeout=90.0, follow_redirects=True, headers=headers) as client:
-                response = await client.get(fresh_url)
-                response.raise_for_status()
-                xml_content = response.content
-
-            soup = BeautifulSoup(xml_content, "xml")
-            parsed_items = []
-
-            offers = soup.find_all("offer")
-            if offers:
-                print(f"Формат Rozetka/YML. Знайдено карток: {len(offers)}")
-                for offer in offers:
-                    offer_id = (offer.get("id") or "").strip()
-                    available = offer.get("available", "false").lower() == "true"
-
-                    vc_tag = offer.find("vendorCode") or offer.find("article") or offer.find("barcode")
-                    vendor_code = vc_tag.text.strip() if vc_tag and vc_tag.text else ""
-
-                    name_elem = offer.find("name")
-                    name = name_elem.text.strip() if name_elem else ""
-
-                    price_elem = offer.find("price")
-                    price = price_elem.text.strip() if price_elem else "0"
-
-                    currency_elem = offer.find("currencyId")
-                    currency = currency_elem.text.strip() if currency_elem else "UAH"
-
-                    url_elem = offer.find("url")
-                    url = url_elem.text.strip() if url_elem else ""
-
-                    desc_elem = offer.find("description")
-                    desc_text = clean_html(desc_elem.text) if desc_elem else ""
-
-                    category_elem = offer.find("categoryId")
-                    category = category_elem.text.strip() if category_elem else ""
-
-                    params = []
-                    for p in offer.find_all("param"):
-                        p_name = (p.get("name") or "").strip()
-                        p_val = p.text.strip()
-                        if p_name and p_val:
-                            params.append(f"{p_name}: {p_val}")
-
-                    codes = f"{offer_id} {vendor_code}".strip()
-                    full_text = f"{codes} {name} {category} {desc_text} {' '.join(params)}".lower()
-
-                    parsed_items.append({
-                        "id": offer_id,
-                        "vendor_code": vendor_code,
-                        "name": name,
-                        "price": f"{price} {currency}".strip(),
-                        "currency": currency,
-                        "available": available,
-                        "url": url,
-                        "params": "; ".join(params[:5]),
-                        "description": desc_text[:200],
-                        "name_lower": name.lower(),
-                        "search_blob": full_text,
-                        "tokens": set(re.findall(r"[\w\d]+", full_text))
-                    })
-            else:
-                items = soup.find_all("item")
-                print(f"Формат Google Feed. Знайдено карток: {len(items)}")
-                for item in items:
-                    g_id = item.find(["g:id", "id"])
-                    offer_id = g_id.text.strip() if g_id else ""
-
-                    title = item.find(["g:title", "title"])
-                    name = title.text.strip() if title else ""
-
-                    price_elem = item.find(["g:price", "price"])
-                    price = price_elem.text.strip() if price_elem else "0"
-
-                    link_elem = item.find(["g:link", "link"])
-                    url = link_elem.text.strip() if link_elem else ""
-
-                    desc_elem = item.find(["g:description", "description"])
-                    desc_text = clean_html(desc_elem.text) if desc_elem else ""
-
-                    avail_elem = item.find(["g:availability", "availability"])
-                    avail_str = avail_elem.text.strip().lower() if avail_elem else ""
-                    available = ("in_stock" in avail_str) or ("in stock" in avail_str) or (avail_str == "true")
-
-                    mpn_elem = item.find(["g:mpn", "mpn"])
-                    vendor_code = mpn_elem.text.strip() if mpn_elem else offer_id
-
-                    codes = f"{offer_id} {vendor_code}".strip()
-                    full_text = f"{codes} {name} {desc_text}".lower()
-
-                    parsed_items.append({
-                        "id": offer_id,
-                        "vendor_code": vendor_code,
-                        "name": name,
-                        "price": price,
-                        "currency": "UAH",
-                        "available": available,
-                        "url": url,
-                        "params": "",
-                        "description": desc_text[:200],
-                        "name_lower": name.lower(),
-                        "search_blob": full_text,
-                        "tokens": set(re.findall(r"[\w\d]+", full_text))
-                    })
-
-            self.products = parsed_items
-            self.last_updated = time.time()
-            print(f"Індексацію завершено. Готово до продажу товарів: {len(self.products)}")
-        except Exception as e:
-            print(f"Помилка при завантаженні фіда: {e}")
-
-    def search_relevant_products(self, query: str, limit: int = 6) -> list:
-        if not self.products:
-            return []
-
-        raw_query = query.strip().lower()
-        fixed_layout = fix_keyboard_layout(raw_query)
-
-        tokens = set(re.findall(r"[\w\d]+", raw_query))
-        if fixed_layout != raw_query:
-            tokens.update(re.findall(r"[\w\d]+", fixed_layout))
-
-        query_tokens = [t for t in tokens if len(t) >= 2]
-        if not query_tokens:
-            return self.products[:limit]
-
-        # 1. Точний пошук за кодом або артикулом
-        exact_matches = []
-        for p in self.products:
-            p_id = p["id"].lower()
-            p_code = p["vendor_code"].lower()
-            for token in query_tokens:
-                if (p_id and token == p_id) or (p_code and token == p_code):
-                    exact_matches.append(p)
-                    break
-        if exact_matches:
-            return exact_matches[:limit]
-
-        # 2. Розширення токенів основами, синонімами та зняттям подвоєнь
-        expanded_terms = set()
-        for t in query_tokens:
-            expanded_terms.add(t)
-            stem = normalize_stem(t)
-            expanded_terms.add(stem)
-            
-            # Якщо є в індексі синонімів
-            if t in SYNONYMS_INDEX:
-                expanded_terms.update(SYNONYMS_INDEX[t])
-            if stem in SYNONYMS_INDEX:
-                expanded_terms.update(SYNONYMS_INDEX[stem])
-
-        # 3. Скоринг релевантності
-        scored = []
-        for p in self.products:
-            score = 0
-            p_name = p["name_lower"]
-            p_tokens = p["tokens"]
-            p_blob = p["search_blob"]
-
-            for term in expanded_terms:
-                if len(term) < 2:
-                    continue
-                # Точний або частковий збіг у назві
-                if term in p_name:
-                    score += 12
-                # Збіг у токенах характеристик/опису
-                elif term in p_tokens:
-                    score += 4
-                # М'який підрядок у повному блобі
-                elif term in p_blob:
-                    score += 2
-
-            if score > 0:
-                if p["available"]:
-                    score += 5
+    async def update_feed(self, url='', file=''):
+        async with self._lock:
+            if not url and not file:
+                log.warning('Catalog source is not configured')
+                return False
+            try:
+                if url:
+                    parsed=urlparse(url)
+                    if parsed.scheme!='https': raise ValueError('Catalog URL must be https')
+                    async with httpx.AsyncClient(timeout=20,follow_redirects=False) as client:
+                        res=await client.get(url); res.raise_for_status(); content=res.content
+                    if len(content)>25_000_000: raise ValueError('Catalog too large')
                 else:
-                    score -= 3
-                scored.append((score, p))
+                    content=Path(file).read_bytes()
+                    if len(content)>25_000_000: raise ValueError('Catalog too large')
+                if content.lstrip().startswith((b'{',b'[')):
+                    data=json.loads(content)
+                    if isinstance(data,dict): data=data.get('products',[])
+                else:
+                    root=SafeET.fromstring(content)
+                    data=[]
+                    for offer in root.findall('.//offer'):
+                        data.append({'id':offer.get('id'), 'name':_text(offer,'name'), 'vendor_code':_text(offer,'vendorCode') or _text(offer,'vendor_code'),
+                         'price':_text(offer,'price'), 'available':offer.get('available','false'), 'url':_text(offer,'url'),
+                         'description':_text(offer,'description')})
+                if not isinstance(data,list): raise ValueError('Invalid products feed')
+                clean=[x for item in data if (x:=_normalize(item))]
+                if not clean: raise ValueError('No valid products in feed (keeping old catalog)')
+                self.products=clean
+                self.by_id={x['id']:x for x in clean}
+                from datetime import datetime,timezone
+                self.last_updated=datetime.now(timezone.utc).isoformat()
+                self.loaded=True
+                return True
+            except Exception:
+                log.exception('Catalog refresh failed, keeping previous snapshot')
+                return False
 
-        scored.sort(key=lambda x: x[0], reverse=True)
-        return [item[1] for item in scored[:limit]]
+    def get(self,product_id): return self.by_id.get(str(product_id))
+    def search_relevant_products(self,query,limit=5):
+        tokens=re.findall(r'[\wа-яіїєґ]+',query.casefold(),flags=re.I)
+        tokens=[t for t in tokens if len(t)>2][:20]
+        if not tokens: return []
+        ranked=[]
+        for p in self.products:
+            name=p['name'].casefold(); sku=p['vendor_code'].casefold(); desc=p['description'].casefold()
+            score=sum(7 if t in sku else 5 if t in name else 1 if t in desc else 0 for t in tokens)
+            if score: ranked.append((score, bool(p['available']),p))
+        ranked.sort(key=lambda r:(r[0],r[1]),reverse=True)
+        return [r[2] for r in ranked[:limit]]
 
-catalog = CatalogManager(HOROSHOP_FEED_URL)
+catalog=Catalog()
