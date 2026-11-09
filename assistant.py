@@ -18,13 +18,13 @@ SYSTEM = '''Ти AI-консультант інтернет-магазину б�
 Єдине джерело тверджень про конкретні товари — надані facts. Не вигадуй характеристик, сумісності,
 пропорцій змішування чи витрати, якщо їх немає в facts.
 Ціни, посилання і наявність показуються окремими серверними картками: не дублюй ціни вручну в тексті.
-Якщо клієнт шукає покриття для специфічних поверхонь (ванни, радіатори, мікрохвильовки, печі), пропонуй лише ті варіанти з facts, у яких це прямо зазначено в призначенні/описі.
-Якщо технічних даних бракує — скажи про це та запропонуй допомогу менеджера.
+Якщо клієнт шукає специфічні покриття (ванни, радіатори, мікрохвильові печі, гумова фарба, покрівля), пропонуй лише ті варіанти з facts, у яких це зазначено в назві чи описі.
+Якщо в facts є відповідні товари — обов'язково коротко опиши їх застосування і поверни їхні id у product_ids.
 Не давай порад зі змішування побутової хімії чи іншого небезпечного застосування.
 
 ФОРМАТ ВІДПОВІДІ:
 Поверни строго валідний JSON: {"text":"відповідь", "product_ids":["id"], "handoff":false}.
-product_ids — лише id товарів із facts, які дійсно підходять.
+product_ids — лише id товарів із facts, які дійсно підходять (від 1 до 4 id).
 handoff=true встановлюй тоді, коли потрібне пряме втручання менеджера або точних характеристик немає.'''
 
 SALESDRIVE_STATUSES = {
@@ -44,7 +44,7 @@ def normalize_code(val: str) -> str:
     return s.translate(trans)
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    """Пошук замовлення в SalesDrive CRM за зовнішнім номером заявки (Хорошоп) або телефоном."""
+    """Пошук замовлення в SalesDrive CRM з першочерговим акцентом на Зовнішній номер заявки (externalId)."""
     if not domain or not api_key:
         return {"found": False, "message": "SalesDrive не налаштовано."}
 
@@ -55,21 +55,30 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json"}
+    headers = {
+        "X-Api-Key": api_key,
+        "Accept": "application/json",
+        "User-Agent": "ABV-AI-Assistant/3.0"
+    }
 
-    # Пріоритет: пошук за Зовнішнім номером заявки (Хорошоп) та за телефоном
-    queries = [
-        {"filter[search]": query_str},
-        {"filter[search]": query_str[-10:] if len(clean_digits) >= 10 else query_str}
-    ]
+    # Пріоритетні запити: спочатку точний externalId (Зовнішній номер заявки з сайту)
+    queries = []
     if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
-        queries.append({"filter[externalId]": clean_digits})
-        queries.append({"idFrom": int(clean_digits), "idTo": int(clean_digits)})
+        # 1. Зовнішній номер заявки як рядок і число
+        queries.append({"filter[externalId]": query_str})
+        queries.append({"filter[externalId]": int(query_str)})
+        # 2. Повнотекстовий пошук
+        queries.append({"filter[search]": query_str})
+        # 3. Внутрішній ID на випадок збігу
+        queries.append({"idFrom": int(query_str), "idTo": int(query_str)})
     else:
-        queries.append({"filter[phone]": clean_digits[-10:]})
+        # Телефон клієнта
+        phone_10 = clean_digits[-10:] if len(clean_digits) >= 10 else clean_digits
+        queries.append({"filter[phone]": phone_10})
+        queries.append({"filter[search]": phone_10})
 
     try:
-        async with httpx.AsyncClient(timeout=9, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=11, follow_redirects=True) as client:
             for params in queries:
                 res = await client.get(url, params=params, headers=headers)
                 if res.status_code == 200:
@@ -77,6 +86,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
                         m = orders[0]
+                        # Повертаємо саме Зовнішній номер заявки
                         ext_id = m.get("externalId") or m.get("id") or query_str
                         
                         st = m.get("status")
@@ -100,6 +110,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         if order_date and "T" in str(order_date):
                             order_date = str(order_date).split("T")[0]
 
+                        log.info(f"SalesDrive успішно знайдено замовлення №{ext_id}, статус: {st_name}")
                         return {
                             "found": True,
                             "order_id": ext_id,
@@ -114,11 +125,12 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 def retrieval_query(message, history):
     q_lower = message.casefold()
     extra = ""
-    # Якщо шукають відновлення поверхонь, додаємо точні маркери з каталогу
     if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "печ")):
-        extra = " мікрохвильових печей ceramic ванн"
+        extra = " ceramic мікрохвильових печей"
     elif "ванн" in q_lower:
         extra = " ceramic реставрація ванн"
+    elif any(k in q_lower for k in ("гумов", "резинов")):
+        extra = " гумова фарба покрівля"
 
     current = tokens(message + extra)
     context = [h['text'] for h in history[-8:] if h['role'] == 'user'][-3:]
@@ -134,6 +146,7 @@ def fallback(message, items):
         elif 'pla' in q: question = 'Який колір і фасування PLA вам потрібні?'
         elif 'філамент' in q or '3d' in q: question = 'Який тип пластику й колір потрібні?'
         elif re.search(r'мікрохвильов|микроволнов', q): question = 'Потрібно пофарбувати корпус ззовні чи внутрішню камеру?'
+        elif re.search(r'гумов|резинов', q): question = 'Для якої поверхні потрібна гумова фарба (дах, фасад, цоколь чи бетон)?'
         elif re.search(r'метал|дерев|бетон|пласт|скл|стін|підлог', q): question = 'Це роботи всередині приміщення чи на вулиці?'
         return 'Знайшов відповідні товари за вашим запитом — перегляньте картки нижче. ' + question
     return 'Не знайшов точного збігу в каталозі за цим запитом. Уточніть назву або артикул товару чи залиште заявку менеджеру.'
@@ -154,14 +167,16 @@ class Assistant:
                 'handoff': True
             }
 
-        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Пріоритет перед пошуком замовлень)
+        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Лише якщо є явне слово-маркер або літери в коді)
         is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
-        if is_article_intent or re.search(r'^[a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{4,15}$', q):
+        has_letters_code = bool(re.search(r'^[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+', q) or re.search(r'[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
+        
+        if is_article_intent or (has_letters_code and not re.search(r'\b(замовлен|заявк|статус|ттн)\b', q)):
             art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
             if art_match:
                 candidate_raw = art_match.group(1).strip()
                 candidate_norm = normalize_code(candidate_raw)
-                if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки'):
+                if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки', 'статус'):
                     found_by_art = []
                     for p in self.catalog.products.values():
                         p_code_norm = normalize_code(p.vendor_code) if p.vendor_code else ''
@@ -179,17 +194,18 @@ class Assistant:
         phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
         is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
         
-        # Перевіряємо, чи попередня відповідь бота просила назвати номер
+        # Перевірка, чи попереднє повідомлення бота просило ввести номер замовлення
         last_bot_asked_order = False
         if history and history[-1].get('role') == 'assistant':
             last_text = history[-1].get('text', '').casefold()
-            if 'номер вашого замовлення' in last_text or 'номер заявки' in last_text:
+            if any(phrase in last_text for phrase in ('номер вашого замовлення', 'номер заявки', 'перевірю статус')):
                 last_bot_asked_order = True
 
         order_match = None
         if not is_article_intent:
             order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
-            if not order_match and (is_status_req or last_bot_asked_order):
+            # Якщо клієнт просто написав число (наприклад, "19139") після запитання або запиту статусу
+            if not order_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'\d{4,8}', q)):
                 m = re.search(r'\b([1-9]\d{3,7})\b', q)
                 if m:
                     order_match = m
@@ -206,6 +222,7 @@ class Assistant:
                     search_id = prev_digits.group(1)
                     break
 
+        # Якщо знайдено номер або телефон для пошуку замовлення
         if search_id:
             info = await fetch_salesdrive_status(
                 self.settings.salesdrive_domain,
@@ -216,7 +233,7 @@ class Assistant:
                 ttn_part = (
                     f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
                     if info.get("ttn")
-                    else "Номер ТТН ще формується на складі та надійде вам у SMS після відправлення."
+                    else "Номер ТТН ще формується на складі та буде надісланий у SMS після відправки."
                 )
                 msg = (
                     f"Інформація щодо замовлення №{info['order_id']}:\n"
@@ -226,14 +243,14 @@ class Assistant:
                 return {'reply': msg, 'products': [], 'handoff': False}
             else:
                 return {
-                    'reply': f"Замовлення за номером '{search_id}' не знайдено в системі SalesDrive. Перевірте номер замовлення або зверніться до менеджера.",
+                    'reply': f"Замовлення за номером '{search_id}' не знайдено в системі SalesDrive. Перевірте, будь ласка, Зовнішній номер заявки з сайту або зверніться до менеджера.",
                     'products': [],
                     'handoff': True
                 }
 
         if is_status_req and not search_id:
             return {
-                'reply': "Вкажіть, будь ласка, номер вашого замовлення з сайту (наприклад, 19138) або контактний телефон, і я одразу перевірю статус та номер ТТН!",
+                'reply': "Вкажіть, будь ласка, номер вашого замовлення з сайту (наприклад, 19139) або контактний телефон, і я одразу перевірю статус та номер ТТН!",
                 'products': [],
                 'handoff': False
             }
