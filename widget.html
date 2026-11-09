@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="uk">
+<head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover"><title>Консультант — ABV Хімія</title><link rel="stylesheet" href="/static/widget.css"><script src="/static/widget.js" defer></script></head>
+<body>
+<main class="chat" aria-label="Консультант ABV Хімія">
+  <header class="header"><div class="logo" aria-hidden="true">ABV<span>ХІМІЯ</span></div><div class="header-copy"><h1>Допоможемо з вибором</h1><p>AI-консультант магазину</p></div><button id="close" class="icon embedded-only" aria-label="Закрити чат">×</button></header>
+  <div id="notice" class="notice" role="status">Підключаємо каталог…</div>
+  <section id="messages" class="messages" role="log" aria-live="polite" aria-label="Розмова">
+    <div class="message assistant"><span class="eyebrow">ABV ХІМІЯ</span><p>Вітаю! Допоможу знайти товар і розібратися з характеристиками. Що потрібно зробити?</p></div>
+    <div class="chips" id="suggestions"><button data-question="Допоможи підібрати клей">Підібрати клей</button><button data-question="Потрібна фарба">Знайти фарбу</button><button data-question="Шукаю філамент PLA">Пластик для 3D</button></div>
+  </section>
+  <div class="tools"><button id="manager" class="text-button">Заявка менеджеру ↗</button><button id="clear" class="text-button muted">Очистити діалог</button></div>
+  <form id="composer" class="composer"><label class="sr-only" for="question">Ваше питання</label><textarea id="question" rows="1" maxlength="2000" placeholder="Напишіть, що шукаєте…" required></textarea><button id="send" type="submit" aria-label="Надіслати повідомлення">↑</button></form>
+  <footer>Ціни й наявність — у картках. Технічні поради звіряйте з інструкцією виробника. <a id="privacy" href="/privacy" target="_blank" rel="noopener">Конфіденційність</a></footer>
+</main>
+<dialog id="lead-dialog" aria-labelledby="lead-title">
+  <form id="lead-form"><div class="dialog-heading"><h2 id="lead-title">Заявка менеджеру</h2><button id="cancel" type="button" class="icon" aria-label="Закрити форму">×</button></div>
+    <p id="lead-product">Контакт потрібен лише для опрацювання вашого звернення.</p>
+    <label for="name">Як до вас звертатися <span class="muted">(необов’язково)</span></label><input id="name" maxlength="100" autocomplete="name">
+    <label for="phone">Телефон</label><input id="phone" type="tel" maxlength="32" autocomplete="tel" placeholder="+380…" required>
+    <label for="note">Що потрібно уточнити <span class="muted">(необов’язково)</span></label><textarea id="note" rows="3" maxlength="1000"></textarea>
+    <label class="consent"><input id="consent" type="checkbox" required><span>Погоджуюся на обробку контакту та передавання питання менеджеру відповідно до <a id="consent-privacy" href="/privacy" target="_blank" rel="noopener">політики конфіденційності</a>.</span></label>
+    <p id="lead-error" class="error" role="alert"></p><button id="lead-submit" class="primary" type="submit">Надіслати заявку</button><p class="form-foot">Це звернення до менеджера. Купівля та оплата узгоджуються окремо.</p>
+  </form>
+</dialog>
+</body></html>

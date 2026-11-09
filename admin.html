@@ -1,0 +1,6 @@
+<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Заявки — ABV Хімія</title><link rel="stylesheet" href="/static/admin.css"><script src="/static/admin.js" defer></script></head>
+<body><main><header><div><p class="brand">ABV ХІМІЯ / КАБІНЕТ МЕНЕДЖЕРА</p><h1>Заявки з чату</h1></div><button id="logout">Вийти</button></header>
+<form id="login"><label for="token">Ключ адміністратора</label><div class="row"><input id="token" type="password" autocomplete="off" required placeholder="ADMIN_TOKEN"><button type="submit">Увійти</button></div><small>Ключ зберігається лише в пам’яті вкладки. Сесію буде очищено через 15 хвилин без дій.</small></form>
+<p id="error" role="alert"></p><p id="overview" role="status"></p>
+<section id="workspace" hidden><div class="row filters"><label for="filter">Стан</label><select id="filter"><option value="">Усі</option><option value="new">Нові</option><option value="in_progress">У роботі</option><option value="done">Опрацьовані</option></select><button id="refresh">Оновити</button><button id="catalog-refresh">Оновити каталог</button></div><div id="leads"></div><div class="row"><button id="prev">← Назад</button><span id="page"></span><button id="next">Далі →</button></div></section>
+</main></body></html>
