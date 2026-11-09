@@ -19,46 +19,51 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# Ліміт збільшено до 64 МБ для безперешкодного завантаження великих вивантажень Хорошопу
+# Ліміт 64 МБ для безперешкодного парсингу повного експорту Хорошопу
 MAX_BYTES = 64 * 1024 * 1024
 
 STOP = set(
     'потрібен потрібна потрібно порадь підкажи будь ласка хочу купити товар товари '
-    'для на в у і та є який яка які як чи мені мене це цей ця маєте знайти шукаю'.split()
+    'для на в у і та є який яка які як чи мені мене це цей ця маєте знайти шукаю добро дня добрий вечір'.split()
 )
 
-# Розширений словник відповідностей та синонімів специфіки abvhimiya.com.ua
+# Словник корекції та розширення форм слів специфіки abvhimiya.com.ua
 ALIASES = {
     # Клеї та епоксиди
     'эпоксид': 'епоксид', 'epoxy': 'епоксид', 'епоксидка': 'епоксид',
     'клея': 'клей', 'клею': 'клей', 'клеї': 'клей', 'клей-піна': 'клей', 'клейпіна': 'клей',
     # Метали
-    'металла': 'метал', 'металу': 'метал', 'металі': 'метал', 'steel': 'метал', 
+    'металла': 'метал', 'металу': 'метал', 'металі': 'метал', 'steel': 'метал',
     'сталь': 'метал', 'сталі': 'метал', 'стали': 'метал', 'залізо': 'метал',
-    # Фарби, емалі, сантехніка
-    'ванны': 'ванн', 'ванни': 'ванн', 'ванну': 'ванн',
+    # Сантехніка та ванни
+    'ванны': 'ванн', 'ванни': 'ванн', 'ванну': 'ванн', 'ванною': 'ванн',
+    # Фарби та емалі
     'краска': 'фарб', 'фарба': 'фарб', 'фарби': 'фарб', 'фарбу': 'фарб', 'фарбою': 'фарб',
-    'емалі': 'емаль', 'эмаль': 'емаль', 'аерозоль': 'балончик', 'спрей': 'балончик',
-    'мікрохвильовка': 'термостійк', 'мікрохвильовки': 'термостійк', 'микроволновка': 'термостійк',
-    'піч': 'термостійк', 'печі': 'термостійк', 'камін': 'термостійк', 'димохід': 'термостійк',
+    'емалі': 'емал', 'емаль': 'емал', 'эмаль': 'емал', 'аерозоль': 'балончик', 'спрей': 'балончик',
+    # Побутова техніка (зберігаємо мікрохвильов + печ для прямого пошуку)
+    'мікрохвильовка': 'мікрохвильов', 'мікрохвильовки': 'мікрохвильов', 'мікрохвильовкі': 'мікрохвильов',
+    'микроволновка': 'мікрохвильов', 'микроволновки': 'мікрохвильов',
+    'печі': 'печ', 'печь': 'печ', 'піч': 'печ', 'духовка': 'термостійк', 'камін': 'термостійк',
     # 3D-друк
     'филамент': 'філамент', 'нитка': 'філамент', 'пластик': 'філамент',
     # Герметики та піна
     'герметика': 'герметик', 'герметику': 'герметик', 'силикон': 'силікон',
-    'піни': 'піна', 'піну': 'піна', 'пена': 'піна',
+    'піни': 'пін', 'піну': 'пін', 'пена': 'пін',
     # Розчинники
     'растворитель': 'розчинник', 'розчинника': 'розчинник', 'сольвенту': 'сольвент',
     'уайтспірит': 'уайт-спірит', 'спирит': 'уайт-спірит', 'калоша': 'нефрас'
 }
 
+# Кольори для точного визначення вибору покупця
+COLORS = {'білий', 'чорний', 'прозорий', 'сірий', 'червоний', 'синій', 'зелений', 'жовтий', 'золото', 'срібло'}
+
 def clean(value, length=4000):
     return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', str(value or ''))))[:length].strip()
 
 def normalize_code(val: str) -> str:
-    """Очищення артикулів/кодів для надійного порівняння (латиниця/кирилиця, дефіси)."""
+    """Очищення артикулів і кодів: прибирає дефіси, пробіли та зводить схожі кириличні літери до латиниці."""
     s = val.strip().casefold()
     s = s.replace('-', '').replace(' ', '').replace('_', '')
-    # Заміна поширених візуально однакових літер (кирилиця -> латиниця)
     trans = str.maketrans('асрокемітх', 'acpokemitx')
     return s.translate(trans)
 
@@ -69,8 +74,9 @@ def tokens(text):
         if word in STOP or len(word) < 2:
             continue
         word = ALIASES.get(word, word)
-        for stem in ('епоксид', 'метал', 'бетон', 'дерев', 'ванн', 'фарб', 'герметик', 
-                     'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал', 'термостійк'):
+        for stem in ('епоксид', 'метал', 'бетон', 'дерев', 'ванн', 'фарб', 'герметик',
+                     'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал',
+                     'термостійк', 'мікрохвильов', 'печ', 'керамік', 'акваріум'):
             if word.startswith(stem):
                 word = stem
                 break
@@ -113,7 +119,7 @@ class Catalog:
         pid, name = clean(raw.get('id'), 120), clean(raw.get('name'), 250)
         if not pid or not name:
             raise ValueError('Product needs id and name')
-        
+
         curr = str(raw.get('currency', raw.get('currencyId', 'UAH'))).upper()
         if curr != 'UAH':
             raise ValueError(f'Only UAH is supported (got {curr})')
@@ -158,7 +164,7 @@ class Catalog:
     def decode(self, content):
         if len(content) > MAX_BYTES:
             raise ValueError('Catalog is too large')
-        
+
         if content.lstrip().startswith(b'<'):
             root = ElementTree.fromstring(content)
             raws = []
@@ -181,7 +187,7 @@ class Catalog:
         for raw in raws:
             p = self.parse_product(raw)
             if p.id in products:
-                continue  # Пропускаємо дублікати ID, замість аварійного падіння
+                continue
             products[p.id] = p
         return products
 
@@ -189,12 +195,11 @@ class Catalog:
         parsed = urlsplit(self.settings.catalog_url)
         if parsed.scheme != 'https' or parsed.hostname not in self.settings.catalog_hosts or parsed.username or parsed.password or parsed.port not in (None, 443):
             raise ValueError('Catalog source must be HTTPS on CATALOG_ALLOWED_HOSTS')
-        
+
         addresses = await asyncio.to_thread(socket.getaddrinfo, parsed.hostname, 443, type=socket.SOCK_STREAM)
         if not addresses or any(not ipaddress.ip_address(x[4][0]).is_global for x in addresses):
             raise ValueError('Private catalog destinations are prohibited')
 
-        # follow_redirects=True обов'язковий для систем експорту Хорошопу
         headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
         async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
             async with client.stream('GET', self.settings.catalog_url, headers=headers) as r:
@@ -234,7 +239,7 @@ class Catalog:
                 temp = self.snapshot.with_suffix('.tmp')
                 await asyncio.to_thread(temp.write_text, json.dumps(data, ensure_ascii=False), encoding='utf-8')
                 os.replace(temp, self.snapshot)
-                
+
                 self.products, self.updated_at, self.last_error = products, updated_at, None
                 log.info(f"Catalog successfully refreshed. Total valid products: {len(products)}")
                 return True
@@ -259,16 +264,18 @@ class Catalog:
     def search(self, query, limit=4):
         clean_q = query.strip()
         norm_q = normalize_code(clean_q)
-        
-        # 1. Швидкий пошук за прямим збігом артикулу або ID
+
+        # 1. Пошук за артикулом або ID товару (точний або частковий для артикулів від 4 символів)
         exact_matches = []
         for p in self.products.values():
-            if norm_q and (norm_q == normalize_code(p.id) or (p.vendor_code and norm_q == normalize_code(p.vendor_code))):
+            p_code = normalize_code(p.vendor_code) if p.vendor_code else ''
+            p_id = normalize_code(p.id)
+            if norm_q and (norm_q in (p_id, p_code) or (len(norm_q) >= 4 and (norm_q == p_code.lstrip('0') or norm_q in p_code))):
                 exact_matches.append(p)
         if exact_matches:
             return exact_matches[:limit]
 
-        # 2. Лексичний пошук за токенами
+        # 2. Токенізація запиту
         words = tokens(clean_q)
         if not words:
             return []
@@ -278,36 +285,45 @@ class Catalog:
                 return word == term
             return term.startswith(word) or word.startswith(term)
 
+        # Оновлення індексу пошуку, якщо каталог змінився
         if self._indexed_products is not self.products:
             self._index = [
                 (
                     p,
                     tokens(p.name + ' ' + p.vendor_code),
-                    tokens(p.description + ' ' + json.dumps(p.attributes, ensure_ascii=False))
+                    tokens(p.description),
+                    tokens(' '.join(f'{k} {v}' for k, v in p.attributes.items()))
                 )
                 for p in self.products.values()
             ]
             self._indexed_products = self.products
 
         ranked = []
-        for p, name_tokens, body_tokens in self._index:
+        for p, name_tokens, desc_tokens, attr_tokens in self._index:
             matched_name = [w for w in words if any(matches(w, t) for t in name_tokens)]
-            matched_body = [w for w in words if any(matches(w, t) for t in body_tokens)]
-            matched = list(dict.fromkeys(matched_name + matched_body))
+            matched_attr = [w for w in words if any(matches(w, t) for t in attr_tokens)]
+            matched_desc = [w for w in words if any(matches(w, t) for t in desc_tokens)]
 
-            if not matched:
+            matched_all = list(dict.fromkeys(matched_name + matched_attr + matched_desc))
+            if not matched_all:
                 continue
 
-            # Сувора відповідність типам матеріалів 3D-друку (PLA не повинен збігатися з іншими)
+            # Сувора перевірка на тип філаменту (PLA не підмінюється на PETG/ABS)
             required_types = [w for w in words if w in ('pla', 'petg', 'pet', 'abs', 'asa', 'tpu')]
             if required_types and not all(any(matches(w, t) for t in name_tokens) for w in required_types):
                 continue
 
-            # Оцінка релевантності: назва має значно більшу вагу, ніж опис
-            score = (len(matched_name) * 8) + (len(matched_body) * 2)
-            
-            # Додатковий бонус, якщо знайдено всі слова запиту
-            coverage = len(matched) / len(words)
+            # Розрахунок релевантності:
+            # Назва: 10 балів, Характеристики (наприклад колір): 5 балів, Опис: 1 бал
+            score = (len(matched_name) * 10) + (len(matched_attr) * 5) + (len(matched_desc) * 1)
+
+            # Пріоритет за збіг за кольором або специфічним словом (мікрохвильовка, ванна)
+            specific_keys = [w for w in words if w in ('мікрохвильов', 'ванн', 'печ', 'керамік', 'акваріум') or w in COLORS]
+            if specific_keys and any(any(matches(sk, t) for t in name_tokens + attr_tokens) for sk in specific_keys):
+                score += 15
+
+            # Коефіцієнт покриття слів запиту
+            coverage = len(matched_all) / len(words)
             final_score = score * (1.0 + coverage)
 
             ranked.append((final_score, bool(p.available), p.name, p))
@@ -316,5 +332,6 @@ class Catalog:
         if not ranked:
             return []
 
-        cutoff = ranked[0][0] * 0.45
+        # М'який поріг відсікання: відбирає схожі позиції, відкидаючи явний шум
+        cutoff = ranked[0][0] * 0.25
         return [x[3] for x in ranked[:limit] if x[0] >= cutoff]
