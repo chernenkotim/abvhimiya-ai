@@ -19,7 +19,7 @@ import httpx
 
 log = logging.getLogger(__name__)
 
-# Ліміт 64 МБ для безперешкодного парсингу повного експорту Хорошопу
+# Ліміт 64 МБ для безперешкодного завантаження великих вивантажень Хорошопу
 MAX_BYTES = 64 * 1024 * 1024
 
 STOP = set(
@@ -27,7 +27,13 @@ STOP = set(
     'для на в у і та є який яка які як чи мені мене це цей ця маєте знайти шукаю добро дня добрий вечір'.split()
 )
 
-# Словник корекції та розширення форм слів специфіки abvhimiya.com.ua
+# Автоматичне виправлення випадкового набору в англійській розкладці
+ENG_TO_UKR = str.maketrans(
+    "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~",
+    "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
+)
+
+# Словник синонімів та нормалізації форм слів інтернет-магазину abvhimiya.com.ua
 ALIASES = {
     # Клеї та епоксиди
     'эпоксид': 'епоксид', 'epoxy': 'епоксид', 'епоксидка': 'епоксид',
@@ -37,10 +43,11 @@ ALIASES = {
     'сталь': 'метал', 'сталі': 'метал', 'стали': 'метал', 'залізо': 'метал',
     # Сантехніка та ванни
     'ванны': 'ванн', 'ванни': 'ванн', 'ванну': 'ванн', 'ванною': 'ванн',
-    # Фарби та емалі
+    # Фарби, емалі, гумова фарба
     'краска': 'фарб', 'фарба': 'фарб', 'фарби': 'фарб', 'фарбу': 'фарб', 'фарбою': 'фарб',
+    'резиновая': 'гумов', 'резинові': 'гумов', 'гумова': 'гумов', 'гумової': 'гумов', 'гумові': 'гумов',
     'емалі': 'емал', 'емаль': 'емал', 'эмаль': 'емал', 'аерозоль': 'балончик', 'спрей': 'балончик',
-    # Побутова техніка (зберігаємо мікрохвильов + печ для прямого пошуку)
+    # Побутова техніка (для точного збігу з BeLife Ceramic)
     'мікрохвильовка': 'мікрохвильов', 'мікрохвильовки': 'мікрохвильов', 'мікрохвильовкі': 'мікрохвильов',
     'микроволновка': 'мікрохвильов', 'микроволновки': 'мікрохвильов',
     'печі': 'печ', 'печь': 'печ', 'піч': 'печ', 'духовка': 'термостійк', 'камін': 'термостійк',
@@ -54,20 +61,30 @@ ALIASES = {
     'уайтспірит': 'уайт-спірит', 'спирит': 'уайт-спірит', 'калоша': 'нефрас'
 }
 
-# Кольори для точного визначення вибору покупця
 COLORS = {'білий', 'чорний', 'прозорий', 'сірий', 'червоний', 'синій', 'зелений', 'жовтий', 'золото', 'срібло'}
+
+def fix_layout_if_needed(text: str) -> str:
+    """Виправляє текст, якщо клієнт набрав запит у неправильній розкладці (наприклад, uevjdf -> гумова)."""
+    raw_lower = text.strip().lower()
+    # Якщо набрано англійськими літерами, але це не артикули і не специфічні терміни
+    if re.search(r'[a-z]{3,}', raw_lower) and not any(w in raw_lower for w in ('pla', 'petg', 'abs', 'tpu', 'belife', 'rino', 'hercul', 'sunlu')):
+        converted = text.translate(ENG_TO_UKR)
+        # Якщо після конвертації з'явилися типові українські літери
+        if re.search(r'[а-яіїєґ]', converted.lower()):
+            return converted
+    return text
 
 def clean(value, length=4000):
     return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', str(value or ''))))[:length].strip()
 
 def normalize_code(val: str) -> str:
-    """Очищення артикулів і кодів: прибирає дефіси, пробіли та зводить схожі кириличні літери до латиниці."""
-    s = val.strip().casefold()
-    s = s.replace('-', '').replace(' ', '').replace('_', '')
+    """Очищення артикулів: видаляє дефіси, пробіли, зводить візуально схожі літери до латиниці."""
+    s = str(val).strip().casefold().replace('-', '').replace(' ', '').replace('_', '')
     trans = str.maketrans('асрокемітх', 'acpokemitx')
     return s.translate(trans)
 
 def tokens(text):
+    text = fix_layout_if_needed(text)
     raw = re.findall(r'[\w-]+', text.casefold())
     result = []
     for word in raw:
@@ -75,7 +92,7 @@ def tokens(text):
             continue
         word = ALIASES.get(word, word)
         for stem in ('епоксид', 'метал', 'бетон', 'дерев', 'ванн', 'фарб', 'герметик',
-                     'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал',
+                     'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал', 'гумов',
                      'термостійк', 'мікрохвильов', 'печ', 'керамік', 'акваріум'):
             if word.startswith(stem):
                 word = stem
@@ -262,10 +279,10 @@ class Catalog:
             log.warning(f"Snapshot restore bypassed: {e}")
 
     def search(self, query, limit=4):
-        clean_q = query.strip()
+        clean_q = fix_layout_if_needed(query.strip())
         norm_q = normalize_code(clean_q)
 
-        # 1. Пошук за артикулом або ID товару (точний або частковий для артикулів від 4 символів)
+        # 1. Пошук за прямим збігом артикулу або ID товару
         exact_matches = []
         for p in self.products.values():
             p_code = normalize_code(p.vendor_code) if p.vendor_code else ''
@@ -285,7 +302,6 @@ class Catalog:
                 return word == term
             return term.startswith(word) or word.startswith(term)
 
-        # Оновлення індексу пошуку, якщо каталог змінився
         if self._indexed_products is not self.products:
             self._index = [
                 (
@@ -308,30 +324,22 @@ class Catalog:
             if not matched_all:
                 continue
 
-            # Сувора перевірка на тип філаменту (PLA не підмінюється на PETG/ABS)
+            # Сувора перевірка на тип філаменту для 3D-друку
             required_types = [w for w in words if w in ('pla', 'petg', 'pet', 'abs', 'asa', 'tpu')]
             if required_types and not all(any(matches(w, t) for t in name_tokens) for w in required_types):
                 continue
 
-            # Розрахунок релевантності:
-            # Назва: 10 балів, Характеристики (наприклад колір): 5 балів, Опис: 1 бал
-            score = (len(matched_name) * 10) + (len(matched_attr) * 5) + (len(matched_desc) * 1)
+            # Розрахунок балів релевантності:
+            score = (len(matched_name) * 12) + (len(matched_attr) * 6) + (len(matched_desc) * 1)
 
-            # Пріоритет за збіг за кольором або специфічним словом (мікрохвильовка, ванна)
-            specific_keys = [w for w in words if w in ('мікрохвильов', 'ванн', 'печ', 'керамік', 'акваріум') or w in COLORS]
+            # Пріоритет за збіг за специфічними категоріями або кольором
+            specific_keys = [w for w in words if w in ('мікрохвильов', 'ванн', 'печ', 'керамік', 'гумов', 'акваріум') or w in COLORS]
             if specific_keys and any(any(matches(sk, t) for t in name_tokens + attr_tokens) for sk in specific_keys):
+                score += 20
+
+            # Бонус за наявність товару на складі
+            if p.available:
                 score += 15
 
             # Коефіцієнт покриття слів запиту
-            coverage = len(matched_all) / len(words)
-            final_score = score * (1.0 + coverage)
-
-            ranked.append((final_score, bool(p.available), p.name, p))
-
-        ranked.sort(key=lambda x: (-x[0], -x[1], x[2]))
-        if not ranked:
-            return []
-
-        # М'який поріг відсікання: відбирає схожі позиції, відкидаючи явний шум
-        cutoff = ranked[0][0] * 0.25
-        return [x[3] for x in ranked[:limit] if x[0] >= cutoff]
+            coverage = len
