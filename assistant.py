@@ -1,4 +1,4 @@
-"""Grounded consultation with contextual retrieval and instant SalesDrive order status lookup."""
+"""Grounded consultation with contextual retrieval, SKU resolution, and SalesDrive order lookup."""
 import asyncio
 import json
 import logging
@@ -14,17 +14,18 @@ SYSTEM = '''Ти AI-консультант інтернет-магазину б�
 Спілкуйся природною українською, стисло й по суті.
 
 ПРАВИЛА РОБОТИ З ТОВАРАМИ:
-Твоє завдання: допомогти вибрати товар і відповісти на питання клієнта.
+Твоє завдання: допомогти вибрати товар і відповісти на запитання клієнта.
 Єдине джерело тверджень про конкретні товари — надані facts. Не вигадуй характеристик, сумісності,
 пропорцій змішування чи витрати, якщо їх немає в facts.
 Ціни, посилання і наявність показуються окремими серверними картками: не дублюй ціни вручну в тексті.
+Якщо потрібної фарби/клею саме з таким вузьким маркуванням немає, але є універсальні емалі, термостійкі фарби або відповідні герметики з facts — запропонуй їх із зазначенням їхнього призначення з опису.
 Якщо технічних даних бракує — скажи про це та запропонуй допомогу менеджера.
 Не давай порад зі змішування побутової хімії чи іншого небезпечного застосування.
 
 ФОРМАТ ВІДПОВІДІ:
 Поверни строго валідний JSON: {"text":"відповідь", "product_ids":["id"], "handoff":false}.
 product_ids — лише id товарів із facts, які дійсно підходять.
-handoff=true встановлюй лише тоді, коли потрібне пряме втручання менеджера.'''
+handoff=true встановлюй тоді, коли потрібне пряме втручання менеджера або точних характеристик немає.'''
 
 SALESDRIVE_STATUSES = {
     1: "Нова заявка",
@@ -37,7 +38,7 @@ SALESDRIVE_STATUSES = {
 }
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    """Пошук замовлення в SalesDrive CRM за зовнішнім номером заявки або телефоном."""
+    """Пошук замовлення в SalesDrive CRM за зовнішнім номером заявки (Хорошоп) або телефоном."""
     if not domain or not api_key:
         return {"found": False, "message": "SalesDrive не налаштовано."}
 
@@ -50,7 +51,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
     url = f"https://{clean_domain}/api/order/list/"
     headers = {"X-Api-Key": api_key, "Accept": "application/json"}
 
-    # Пріоритет: пошук за Зовнішнім номером заявки (Хорошоп) та за телефоном
+    # Пріоритет: повнотекстовий пошук за Зовнішнім номером заявки з сайту та телефоном
     queries = [
         {"filter[search]": query_str},
         {"filter[search]": query_str[-10:] if len(clean_digits) >= 10 else query_str}
@@ -105,22 +106,29 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
     return {"found": False}
 
 def retrieval_query(message, history):
-    current = tokens(message)
+    # Якщо питають про побутову техніку/мікрохвильовку, підмішуємо емаль і термостійку фарбу для кращого пошуку
+    q_lower = message.casefold()
+    extra = ""
+    if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "піч", "печ")):
+        extra = " емаль термостійка фарба метал"
+
+    current = tokens(message + extra)
     context = [h['text'] for h in history[-8:] if h['role'] == 'user'][-3:]
     if len(current) <= 5 and context:
-        return ' '.join(context + [message])[-1200:]
-    return message
+        return ' '.join(context + [message + extra])[-1200:]
+    return (message + extra)
 
 def fallback(message, items):
     if items:
         q = message.casefold()
-        question = 'Для якої поверхні підбираєте матеріал?'
+        question = 'Для якої саме поверхні або завдання підбираєте матеріал?'
         if 'ванн' in q: question = 'З якого матеріалу ванна та чи є на ній старе покриття?'
         elif 'pla' in q: question = 'Який колір і фасування PLA вам потрібні?'
         elif 'філамент' in q or '3d' in q: question = 'Який тип пластику й колір потрібні?'
-        elif re.search(r'метал|дерев|бетон|пласт|скл|стін|підлог', q): question = 'Це роботи в приміщенні чи надворі?'
-        return 'Знайшов товари за вашим запитом — перегляньте картки нижче. ' + question
-    return 'Не знайшов товарів за цим запитом у каталозі. Уточніть назву або артикул товару чи залиште заявку менеджеру.'
+        elif re.search(r'мікрохвильов|микроволнов', q): question = 'Потрібно пофарбувати корпус ззовні чи внутрішню камеру?'
+        elif re.search(r'метал|дерев|бетон|пласт|скл|стін|підлог', q): question = 'Це роботи всередині приміщення чи на вулиці?'
+        return 'Знайшов відповідні товари за вашим запитом — перегляньте картки нижче. ' + question
+    return 'Не знайшов точного збігу в каталозі за цим запитом. Уточніть назву або артикул товару чи залиште заявку менеджеру.'
 
 class Assistant:
     def __init__(self, settings, store, catalog):
@@ -138,10 +146,36 @@ class Assistant:
                 'handoff': True
             }
 
-        # 2. ПЕРЕВІРКА СТАТУСУ ЗАМОВЛЕННЯ ТА ТТН У SALESDRIVE
-        order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#|\b)\s*(\d{4,8})\b', q, re.IGNORECASE)
+        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Пріоритет перед замовленнями)
+        is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
+        if is_article_intent:
+            art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
+            if art_match:
+                candidate_code = art_match.group(1).strip().casefold()
+                if candidate_code not in ('товару', 'товара', 'замовлення', 'заявки'):
+                    found_by_art = [
+                        p for p in self.catalog.products.values()
+                        if candidate_code in p.vendor_code.casefold() or candidate_code in p.id.casefold()
+                    ]
+                    if found_by_art:
+                        return {
+                            'reply': f"Знайшов товар за артикулом/кодом: {found_by_art[0].name}. Перегляньте картку нижче:",
+                            'products': [p.public() for p in found_by_art[:3]],
+                            'handoff': False
+                        }
+
+        # 3. ПЕРЕВІРКА СТАТУСУ ЗАМОВЛЕННЯ ТА ТТН У SALESDRIVE
         phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
         is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
+        
+        order_match = None
+        if not is_article_intent:
+            # Шукаємо явну вказівку номера замовлення (від 1000 до 99999999, не нулі 0000)
+            order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
+            if not order_match and is_status_req:
+                m = re.search(r'\b([1-9]\d{3,7})\b', q)
+                if m:
+                    order_match = m
 
         search_id = None
         if order_match:
@@ -150,9 +184,9 @@ class Assistant:
             search_id = phone_match.group(0)
         elif is_status_req:
             for prev in reversed(history[-2:]):
-                prev_digits = re.search(r'\b\d{4,8}\b', prev.get('text', ''))
+                prev_digits = re.search(r'\b([1-9]\d{3,7})\b', prev.get('text', ''))
                 if prev_digits:
-                    search_id = prev_digits.group(0)
+                    search_id = prev_digits.group(1)
                     break
 
         if search_id:
@@ -163,9 +197,9 @@ class Assistant:
             )
             if info.get("found"):
                 ttn_part = (
-                    f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
+                    f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у мобільному додатку Нової Пошти."
                     if info.get("ttn")
-                    else "Номер ТТН ще формується на складі і буде надісланий у SMS після відправки."
+                    else "Номер ТТН ще формується на складі та надійде вам у SMS після відправлення."
                 )
                 msg = (
                     f"Інформація щодо замовлення №{info['order_id']}:\n"
@@ -175,7 +209,7 @@ class Assistant:
                 return {'reply': msg, 'products': [], 'handoff': False}
             else:
                 return {
-                    'reply': f"Замовлення за номером '{search_id}' не знайдено в базі SalesDrive. Перевірте номер замовлення або зверніться до менеджера.",
+                    'reply': f"Замовлення за номером '{search_id}' не знайдено в системі SalesDrive. Перевірте номер замовлення або зверніться до менеджера.",
                     'products': [],
                     'handoff': True
                 }
@@ -187,26 +221,28 @@ class Assistant:
                 'handoff': False
             }
 
-        # 3. Ввічливі фрази та менеджер
+        # 4. Ввічливі фрази та звернення до менеджера
         if re.fullmatch(r'(?:дякую|дуже дякую|спасибі|ок|добре|зрозуміло)[!.\s]*', q):
-            return {'reply': 'Будь ласка! Якщо потрібні інші товари або консультація — звертайтеся.', 'products': [], 'handoff': False}
+            return {'reply': 'Будь ласка! Якщо потрібні інші матеріали чи консультація — звертайтеся.', 'products': [], 'handoff': False}
 
         if re.search(r'менеджер|оператор|людин[аоу]|зателефон|передзвон|зв[’\x27]яз', q):
-            return {'reply': 'Залиште свій контакт у формі — менеджер отримає заявку та зв’яжеться з вами для консультації.', 'products': [], 'handoff': True}
+            return {'reply': 'Залиште свій контакт у формі — менеджер отримає заявку та оперативно зв’яжеться з вами.', 'products': [], 'handoff': True}
 
         if re.search(r'^(привіт|вітаю|добрий (день|вечір|ранок)|доброго (дня|вечора|ранку))[!?.\s]*$', q):
             return {'reply': 'Вітаю! Допоможу підібрати будівельну хімію або пластик для 3D-друку з каталогу ABV Хімія. Що саме ви шукаєте?', 'products': [], 'handoff': False}
 
         if not self.catalog.fresh:
-            return {'reply': 'Каталог зараз оновлюється. Залиште заявку, і менеджер оперативно підкаже наявність та ціну.', 'products': [], 'handoff': True}
+            return {'reply': 'Каталог зараз оновлюється. Залиште заявку у формі, і менеджер оперативно підкаже наявність та ціну.', 'products': [], 'handoff': True}
 
-        # 4. Пошук по каталогу
-        items = self.catalog.search(retrieval_query(message, history))
+        # 5. Пошук по каталогу товарів
+        query_text = retrieval_query(message, history)
+        items = self.catalog.search(query_text)
+
         technical = bool(re.search(r'сумісн|витрат|пропорц|тверд|температур|скільки|підійде|підходить|можна', q))
         reply, handoff = fallback(message, items), not bool(items)
 
         if technical:
-            reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного товару. Нижче наведено знайдені позиції; якщо потрібне додаткове узгодження, допоможе менеджер.'
+            reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
             handoff = True
 
         used_ai = False
@@ -214,7 +250,9 @@ class Assistant:
             result = await self.generate(message, history, items)
             if result:
                 reply, ids, handoff = result
-                items = [p for p in items if p.id in ids]
+                # Залишаємо відібрані моделлю товари або перші відповідні з каталогу
+                matched_items = [p for p in items if p.id in ids]
+                items = matched_items if matched_items else items[:3]
                 used_ai = True
 
         return {'reply': reply, 'products': [p.public() for p in items], 'handoff': handoff}
@@ -248,9 +286,9 @@ class Assistant:
                     text = result['text'].strip()
                     ids = result['product_ids']
                     allowed = {p.id for p in items}
-                    if not text or len(text) > 3000 or not isinstance(ids, list) or any(i not in allowed for i in ids):
+                    if not text or len(text) > 3000 or not isinstance(ids, list):
                         return None
-                    return text, ids, bool(result.get('handoff', False))
+                    return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
         except Exception as e:
             log.warning(f'AI model response unavailable, using catalog fallback: {e}')
             return None
