@@ -18,7 +18,7 @@ SYSTEM = '''Ти AI-консультант інтернет-магазину б�
 Єдине джерело тверджень про конкретні товари — надані facts. Не вигадуй характеристик, сумісності,
 пропорцій змішування чи витрати, якщо їх немає в facts.
 Ціни, посилання і наявність показуються окремими серверними картками: не дублюй ціни вручну в тексті.
-Якщо потрібної фарби/клею саме з таким вузьким маркуванням немає, але є універсальні емалі, термостійкі фарби або відповідні герметики з facts — запропонуй їх із зазначенням їхнього призначення з опису.
+Якщо клієнт шукає покриття для специфічних поверхонь (ванни, радіатори, мікрохвильовки, печі), пропонуй лише ті варіанти з facts, у яких це прямо зазначено в призначенні/описі.
 Якщо технічних даних бракує — скажи про це та запропонуй допомогу менеджера.
 Не давай порад зі змішування побутової хімії чи іншого небезпечного застосування.
 
@@ -37,6 +37,12 @@ SALESDRIVE_STATUSES = {
     7: "Оплачено"
 }
 
+def normalize_code(val: str) -> str:
+    """Очищення артикулів і кодів (регістр, дефіси, схожі кириличні літери)."""
+    s = str(val).strip().casefold().replace('-', '').replace(' ', '').replace('_', '')
+    trans = str.maketrans('асрокемітх', 'acpokemitx')
+    return s.translate(trans)
+
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
     """Пошук замовлення в SalesDrive CRM за зовнішнім номером заявки (Хорошоп) або телефоном."""
     if not domain or not api_key:
@@ -51,7 +57,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
     url = f"https://{clean_domain}/api/order/list/"
     headers = {"X-Api-Key": api_key, "Accept": "application/json"}
 
-    # Пріоритет: повнотекстовий пошук за Зовнішнім номером заявки з сайту та телефоном
+    # Пріоритет: пошук за Зовнішнім номером заявки (Хорошоп) та за телефоном
     queries = [
         {"filter[search]": query_str},
         {"filter[search]": query_str[-10:] if len(clean_digits) >= 10 else query_str}
@@ -106,11 +112,13 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
     return {"found": False}
 
 def retrieval_query(message, history):
-    # Якщо питають про побутову техніку/мікрохвильовку, підмішуємо емаль і термостійку фарбу для кращого пошуку
     q_lower = message.casefold()
     extra = ""
-    if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "піч", "печ")):
-        extra = " емаль термостійка фарба метал"
+    # Якщо шукають відновлення поверхонь, додаємо точні маркери з каталогу
+    if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "печ")):
+        extra = " мікрохвильових печей ceramic ванн"
+    elif "ванн" in q_lower:
+        extra = " ceramic реставрація ванн"
 
     current = tokens(message + extra)
     context = [h['text'] for h in history[-8:] if h['role'] == 'user'][-3:]
@@ -146,17 +154,20 @@ class Assistant:
                 'handoff': True
             }
 
-        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Пріоритет перед замовленнями)
+        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Пріоритет перед пошуком замовлень)
         is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
-        if is_article_intent:
+        if is_article_intent or re.search(r'^[a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{4,15}$', q):
             art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
             if art_match:
-                candidate_code = art_match.group(1).strip().casefold()
-                if candidate_code not in ('товару', 'товара', 'замовлення', 'заявки'):
-                    found_by_art = [
-                        p for p in self.catalog.products.values()
-                        if candidate_code in p.vendor_code.casefold() or candidate_code in p.id.casefold()
-                    ]
+                candidate_raw = art_match.group(1).strip()
+                candidate_norm = normalize_code(candidate_raw)
+                if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки'):
+                    found_by_art = []
+                    for p in self.catalog.products.values():
+                        p_code_norm = normalize_code(p.vendor_code) if p.vendor_code else ''
+                        p_id_norm = normalize_code(p.id)
+                        if candidate_norm in (p_id_norm, p_code_norm) or (len(candidate_norm) >= 4 and candidate_norm in p_code_norm):
+                            found_by_art.append(p)
                     if found_by_art:
                         return {
                             'reply': f"Знайшов товар за артикулом/кодом: {found_by_art[0].name}. Перегляньте картку нижче:",
@@ -168,11 +179,17 @@ class Assistant:
         phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
         is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
         
+        # Перевіряємо, чи попередня відповідь бота просила назвати номер
+        last_bot_asked_order = False
+        if history and history[-1].get('role') == 'assistant':
+            last_text = history[-1].get('text', '').casefold()
+            if 'номер вашого замовлення' in last_text or 'номер заявки' in last_text:
+                last_bot_asked_order = True
+
         order_match = None
         if not is_article_intent:
-            # Шукаємо явну вказівку номера замовлення (від 1000 до 99999999, не нулі 0000)
             order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
-            if not order_match and is_status_req:
+            if not order_match and (is_status_req or last_bot_asked_order):
                 m = re.search(r'\b([1-9]\d{3,7})\b', q)
                 if m:
                     order_match = m
@@ -180,7 +197,7 @@ class Assistant:
         search_id = None
         if order_match:
             search_id = order_match.group(1)
-        elif phone_match and is_status_req:
+        elif phone_match and (is_status_req or last_bot_asked_order):
             search_id = phone_match.group(0)
         elif is_status_req:
             for prev in reversed(history[-2:]):
@@ -197,7 +214,7 @@ class Assistant:
             )
             if info.get("found"):
                 ttn_part = (
-                    f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у мобільному додатку Нової Пошти."
+                    f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
                     if info.get("ttn")
                     else "Номер ТТН ще формується на складі та надійде вам у SMS після відправлення."
                 )
@@ -250,7 +267,6 @@ class Assistant:
             result = await self.generate(message, history, items)
             if result:
                 reply, ids, handoff = result
-                # Залишаємо відібрані моделлю товари або перші відповідні з каталогу
                 matched_items = [p for p in items if p.id in ids]
                 items = matched_items if matched_items else items[:3]
                 used_ai = True
@@ -283,8 +299,8 @@ class Assistant:
                     data = response.json()
                     parts = data['candidates'][0]['content']['parts']
                     result = json.loads(''.join(p.get('text', '') for p in parts))
-                    text = result['text'].strip()
-                    ids = result['product_ids']
+                    text = str(result.get('text', '')).strip()
+                    ids = result.get('product_ids', [])
                     allowed = {p.id for p in items}
                     if not text or len(text) > 3000 or not isinstance(ids, list):
                         return None
