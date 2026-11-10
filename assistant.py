@@ -386,10 +386,13 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # 2. Пул моделей для відмовостійкості (failover при 503 / 429)
-        configured_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip()
-        models_to_try = [configured_model]
-        for fallback_model in ['gemini-2.5-flash-lite', 'gemini-1.5-flash']:
+        # 2. Пул тільки робочих актуальних моделей Google Gemini (фільтрація 2.5 та 1.5)
+        raw_cfg = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
+        if any(ver in raw_cfg for ver in ('2.5', '1.5', '1.0', '2.0')):
+            raw_cfg = 'gemini-3.8-flash'
+
+        models_to_try = [raw_cfg]
+        for fallback_model in ['gemini-3.8-flash-lite']:
             if fallback_model not in models_to_try:
                 models_to_try.append(fallback_model)
 
@@ -414,14 +417,14 @@ class Assistant:
                         json=body
                     )
 
-                    # Якщо черга або високе навантаження Google (503, 429), миттєво пробуємо резервну
-                    if response.status_code in (503, 429):
-                        log.warning(f"Model {model_name} overloaded ({response.status_code}), switching to backup...")
+                    # Якщо черга (503), ліміт (429) або модель не знайдено (404) — обов'язково продовжуємо цикл на резервну модель!
+                    if response.status_code in (404, 503, 429):
+                        log.warning(f"Model {model_name} status {response.status_code}, switching to next model in pool...")
                         continue
 
                     if response.status_code != 200:
                         log.warning(f"Gemini API ({model_name}) returned status {response.status_code}: {response.text}")
-                        return None
+                        continue
 
                     data = response.json()
                     candidates = data.get('candidates', [])
