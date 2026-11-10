@@ -370,7 +370,6 @@ class Assistant:
             }
 
     async def generate(self, message, history, items):
-        # 1. Відбираємо до 4 товарів з лаконічним описом
         facts = []
         for p in items[:4]:
             facts.append({
@@ -386,16 +385,19 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # 2. Пул тільки нових та дозволених моделей (gemini-3.8-flash)
+        # Відсікаємо префікс 'models/', якщо він прописаний у Render Environment
         configured_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
+        configured_model = configured_model.replace('models/', '')
         
         models_to_try = []
-        # Завжди додаємо актуальну модель, яку вимагав Google
-        for candidate in [configured_model, 'gemini-3.8-flash', 'gemini-3.8-flash-lite']:
-            # Очищаємо префікс "models/", якщо він випадково потрапив із налаштувань
-            clean_candidate = candidate.replace('models/', '')
-            if clean_candidate and clean_candidate not in models_to_try:
-                models_to_try.append(clean_candidate)
+        # Пробуємо основну модель
+        if configured_model not in models_to_try:
+            models_to_try.append(configured_model)
+        
+        # Додаємо стандартні резервні
+        for fallback_model in ['gemini-3.8-flash', 'gemini-2.5-flash']:
+            if fallback_model not in models_to_try:
+                models_to_try.append(fallback_model)
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
@@ -407,54 +409,73 @@ class Assistant:
             }
         }
 
-        # 25 секунд на читання, щоб уникнути ReadTimeout
         custom_timeout = httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
+        
+        # Кількість спроб (Retries) для кожної моделі на випадок 503 / 429
+        max_retries = 2 
 
         for model_name in models_to_try:
-            try:
-                async with self.semaphore, httpx.AsyncClient(timeout=custom_timeout, follow_redirects=False) as client:
-                    response = await client.post(
-                        f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
-                        headers={'x-goog-api-key': self.settings.gemini_key},
-                        json=body
-                    )
+            for attempt in range(max_retries + 1):
+                try:
+                    async with self.semaphore, httpx.AsyncClient(timeout=custom_timeout, follow_redirects=False) as client:
+                        response = await client.post(
+                            f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
+                            headers={'x-goog-api-key': self.settings.gemini_key},
+                            json=body
+                        )
 
-                    # Якщо перевантаження або модель вимкнуто — переходимо до наступної
-                    if response.status_code in (404, 503, 429):
-                        log.warning(f"Model {model_name} status {response.status_code}, switching to next model in pool...")
+                        # Якщо статус 404 (Модель не знайдено) — нема сенсу повторювати, одразу переходимо до наступної моделі
+                        if response.status_code == 404:
+                            log.warning(f"Model {model_name} status 404, switching to next model in pool...")
+                            break 
+
+                        # Якщо статус 503 (Перевантаження) або 429 (Ліміт) — чекаємо і повторюємо ту саму модель
+                        if response.status_code in (503, 429):
+                            if attempt < max_retries:
+                                delay = 1.5 * (attempt + 1)
+                                log.warning(f"Model {model_name} overloaded ({response.status_code}), attempt {attempt+1}, retrying in {delay}s...")
+                                await asyncio.sleep(delay)
+                                continue
+                            else:
+                                log.warning(f"Model {model_name} overloaded after {max_retries} retries, moving on.")
+                                break
+
+                        if response.status_code != 200:
+                            log.warning(f"Gemini API ({model_name}) returned status {response.status_code}: {response.text}")
+                            break
+
+                        data = response.json()
+                        candidates = data.get('candidates', [])
+                        if not candidates:
+                            break
+
+                        parts = candidates[0].get('content', {}).get('parts', [])
+                        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+                        if not raw_text:
+                            break
+
+                        if raw_text.startswith('```'):
+                            raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
+                            raw_text = re.sub(r'\s*```$', '', raw_text)
+
+                        result = json.loads(raw_text, strict=False)
+                        text = str(result.get('text', '')).strip()
+                        ids = [str(x).strip() for x in result.get('product_ids', []) if x]
+                        allowed = {str(getattr(p, 'id', '')).strip() for p in items}
+
+                        if not text:
+                            break
+
+                        return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
+                        
+                except Exception as e:
+                    err_name = type(e).__name__
+                    if attempt < max_retries:
+                        log.warning(f"Error calling {model_name} ({err_name}: {repr(e)}), retrying...")
+                        await asyncio.sleep(1.0)
                         continue
-
-                    if response.status_code != 200:
-                        log.warning(f"Gemini API ({model_name}) returned status {response.status_code}: {response.text}")
-                        continue
-
-                    data = response.json()
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        continue
-
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    raw_text = ''.join(p.get('text', '') for p in parts).strip()
-                    if not raw_text:
-                        continue
-
-                    if raw_text.startswith('```'):
-                        raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
-                        raw_text = re.sub(r'\s*```$', '', raw_text)
-
-                    result = json.loads(raw_text, strict=False)
-                    text = str(result.get('text', '')).strip()
-                    ids = [str(x).strip() for x in result.get('product_ids', []) if x]
-                    allowed = {str(getattr(p, 'id', '')).strip() for p in items}
-
-                    if not text:
-                        continue
-
-                    return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
-            except Exception as e:
-                err_name = type(e).__name__
-                log.warning(f"Error calling {model_name} ({err_name}: {repr(e)}), trying backup...")
-                continue
+                    else:
+                        break
 
         log.warning("All Gemini models unavailable, using catalog fallback")
         return None
