@@ -44,8 +44,9 @@ def normalize_code(val: str) -> str:
     return s.translate(trans)
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    """Пошук замовлення в SalesDrive CRM з першочерговим акцентом на Зовнішній номер заявки (externalId)."""
+    """Пошук замовлення в SalesDrive CRM суворо за Зовнішнім номером заявки з сайту або телефоном."""
     if not domain or not api_key:
+        log.warning("SalesDrive domain or api_key is missing in settings")
         return {"found": False, "message": "SalesDrive не налаштовано."}
 
     clean_digits = re.sub(r'\D', '', target)
@@ -54,41 +55,43 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
         return {"found": False, "message": "Немає даних для пошуку."}
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
-    url = f"https://{clean_domain}/api/order/list/"
+    base_url = f"https://{clean_domain}/api/order/list/"
     headers = {
         "X-Api-Key": api_key,
         "Accept": "application/json",
         "User-Agent": "ABV-AI-Assistant/3.0"
     }
 
-    # Пріоритетні запити: спочатку точний externalId (Зовнішній номер заявки з сайту)
-    queries = []
+    # Формуємо прямі URL, щоб httpx не псував квадратні дужки фільтра SalesDrive
+    urls_to_try = []
     if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
-        # 1. Зовнішній номер заявки як рядок і число
-        queries.append({"filter[externalId]": query_str})
-        queries.append({"filter[externalId]": int(query_str)})
+        # 1. Зовнішній номер заявки (externalId) — точний збіг
+        urls_to_try.append(f"{base_url}?filter[externalId]={query_str}")
+        urls_to_try.append(f"{base_url}?filter[externalId][]={query_str}")
         # 2. Повнотекстовий пошук
-        queries.append({"filter[search]": query_str})
-        # 3. Внутрішній ID на випадок збігу
-        queries.append({"idFrom": int(query_str), "idTo": int(query_str)})
+        urls_to_try.append(f"{base_url}?filter[search]={query_str}")
+        # 3. Внутрішній ID
+        urls_to_try.append(f"{base_url}?idFrom={query_str}&idTo={query_str}")
     else:
-        # Телефон клієнта
+        # Телефон покупця: 10 або 12 цифр
         phone_10 = clean_digits[-10:] if len(clean_digits) >= 10 else clean_digits
-        queries.append({"filter[phone]": phone_10})
-        queries.append({"filter[search]": phone_10})
+        urls_to_try.append(f"{base_url}?filter[phone]={phone_10}")
+        urls_to_try.append(f"{base_url}?filter[phone]=38{phone_10}")
+        urls_to_try.append(f"{base_url}?filter[search]={phone_10}")
 
     try:
-        async with httpx.AsyncClient(timeout=11, follow_redirects=True) as client:
-            for params in queries:
-                res = await client.get(url, params=params, headers=headers)
+        async with httpx.AsyncClient(timeout=10, follow_redirects=True) as client:
+            for req_url in urls_to_try:
+                res = await client.get(req_url, headers=headers)
                 if res.status_code == 200:
                     data = res.json()
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
                         m = orders[0]
-                        # Повертаємо саме Зовнішній номер заявки
+                        # Зовнішній номер заявки з сайту Хорошоп
                         ext_id = m.get("externalId") or m.get("id") or query_str
                         
+                        # Отримання назви статусу
                         st = m.get("status")
                         if isinstance(st, dict):
                             st_name = st.get("text", "В обробці")
@@ -99,10 +102,13 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         else:
                             st_name = "В обробці"
 
+                        # Отримання ТТН Нової Пошти з усіх можливих полів SalesDrive
+                        delivery = m.get("ord_delivery_data", {}) if isinstance(m.get("ord_delivery_data"), dict) else {}
                         ttn = (
                             m.get("trackingNumber") or 
                             m.get("ttn") or 
-                            m.get("ord_delivery_data", {}).get("trackingNumber") or 
+                            delivery.get("trackingNumber") or 
+                            delivery.get("ttn") or 
                             ""
                         )
 
@@ -110,7 +116,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         if order_date and "T" in str(order_date):
                             order_date = str(order_date).split("T")[0]
 
-                        log.info(f"SalesDrive успішно знайдено замовлення №{ext_id}, статус: {st_name}")
+                        log.info(f"SalesDrive успішно знайдено замовлення: externalId={ext_id}, status={st_name}, ttn={ttn}")
                         return {
                             "found": True,
                             "order_id": ext_id,
@@ -120,6 +126,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         }
     except Exception as e:
         log.warning(f"SalesDrive request error: {e}")
+
     return {"found": False}
 
 def retrieval_query(message, history):
@@ -167,11 +174,11 @@ class Assistant:
                 'handoff': True
             }
 
-        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Лише якщо є явне слово-маркер або літери в коді)
+        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (Тільки якщо є слово 'арт/код' або артикул містить літери)
         is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
-        has_letters_code = bool(re.search(r'^[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+', q) or re.search(r'[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
+        has_letters_sku = bool(re.search(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+|[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
         
-        if is_article_intent or (has_letters_code and not re.search(r'\b(замовлен|заявк|статус|ттн)\b', q)):
+        if is_article_intent or (has_letters_sku and not re.search(r'\b(замовлен|заявк|статус|ттн)\b', q)):
             art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
             if art_match:
                 candidate_raw = art_match.group(1).strip()
@@ -194,7 +201,7 @@ class Assistant:
         phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
         is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
         
-        # Перевірка, чи попереднє повідомлення бота просило ввести номер замовлення
+        # Перевіряємо, чи бот у попередній репліці просив ввести номер
         last_bot_asked_order = False
         if history and history[-1].get('role') == 'assistant':
             last_text = history[-1].get('text', '').casefold()
@@ -203,8 +210,9 @@ class Assistant:
 
         order_match = None
         if not is_article_intent:
+            # Шукаємо явно вказаний номер замовлення
             order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
-            # Якщо клієнт просто написав число (наприклад, "19139") після запитання або запиту статусу
+            # Якщо клієнт просто написав число (наприклад "19139") окремим повідомленням
             if not order_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'\d{4,8}', q)):
                 m = re.search(r'\b([1-9]\d{3,7})\b', q)
                 if m:
@@ -213,7 +221,7 @@ class Assistant:
         search_id = None
         if order_match:
             search_id = order_match.group(1)
-        elif phone_match and (is_status_req or last_bot_asked_order):
+        elif phone_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'(?:\+?38)?0\d{9}', q)):
             search_id = phone_match.group(0)
         elif is_status_req:
             for prev in reversed(history[-2:]):
@@ -222,7 +230,6 @@ class Assistant:
                     search_id = prev_digits.group(1)
                     break
 
-        # Якщо знайдено номер або телефон для пошуку замовлення
         if search_id:
             info = await fetch_salesdrive_status(
                 self.settings.salesdrive_domain,
@@ -233,7 +240,7 @@ class Assistant:
                 ttn_part = (
                     f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
                     if info.get("ttn")
-                    else "Номер ТТН ще формується на складі та буде надісланий у SMS після відправки."
+                    else "Номер ТТН ще формується на складі та надійде вам у SMS після відправки."
                 )
                 msg = (
                     f"Інформація щодо замовлення №{info['order_id']}:\n"
