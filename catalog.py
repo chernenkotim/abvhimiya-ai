@@ -1,4 +1,4 @@
-"""Validated JSON/YML catalog, last-good snapshot and Ukrainian lexical search."""
+"""Validated JSON/YML catalog, last-good snapshot, lexical indexing, and fast retrieval."""
 import asyncio
 from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
@@ -22,54 +22,48 @@ log = logging.getLogger(__name__)
 # Ліміт 64 МБ для безперешкодного завантаження великих вивантажень Хорошопу
 MAX_BYTES = 64 * 1024 * 1024
 
-STOP = set(
-    'потрібен потрібна потрібно порадь підкажи будь ласка хочу купити товар товари '
-    'для на в у і та є який яка які як чи мені мене це цей ця маєте знайти шукаю добро дня добрий вечір'.split()
-)
+STOP = frozenset([
+    'потрібен', 'потрібна', 'потрібно', 'порадь', 'підкажи', 'будь', 'ласка', 'хочу', 
+    'купити', 'товар', 'товари', 'для', 'на', 'в', 'у', 'і', 'та', 'є', 'який', 'яка', 
+    'які', 'як', 'чи', 'мені', 'мене', 'це', 'цей', 'ця', 'маєте', 'знайти', 'шукаю', 
+    'добро', 'дня', 'добрий', 'вечір'
+])
 
-# Автоматичне виправлення випадкового набору в англійській розкладці
+# Автоматичне виправлення розкладки
 ENG_TO_UKR = str.maketrans(
     "qwertyuiop[]asdfghjkl;'zxcvbnm,./`QWERTYUIOP{}ASDFGHJKL:\"ZXCVBNM<>?~",
     "йцукенгшщзхїфівапролджєячсмитьбю.ʼЙЦУКЕНГШЩЗХЇФІВАПРОЛДЖЄЯЧСМИТЬБЮ,ʼ"
 )
 
-# Словник синонімів та нормалізації форм слів інтернет-магазину abvhimiya.com.ua
+# Синоніми та стеммінг для ABV Хімія
 ALIASES = {
-    # Клеї та епоксиди
     'эпоксид': 'епоксид', 'epoxy': 'епоксид', 'епоксидка': 'епоксид',
     'клея': 'клей', 'клею': 'клей', 'клеї': 'клей', 'клей-піна': 'клей', 'клейпіна': 'клей',
-    # Метали
     'металла': 'метал', 'металу': 'метал', 'металі': 'метал', 'steel': 'метал',
     'сталь': 'метал', 'сталі': 'метал', 'стали': 'метал', 'залізо': 'метал',
-    # Сантехніка та ванни
     'ванны': 'ванн', 'ванни': 'ванн', 'ванну': 'ванн', 'ванною': 'ванн',
-    # Фарби, емалі, гумова фарба
     'краска': 'фарб', 'фарба': 'фарб', 'фарби': 'фарб', 'фарбу': 'фарб', 'фарбою': 'фарб',
     'резиновая': 'гумов', 'резинові': 'гумов', 'гумова': 'гумов', 'гумової': 'гумов', 'гумові': 'гумов',
     'емалі': 'емал', 'емаль': 'емал', 'эмаль': 'емал', 'аерозоль': 'балончик', 'спрей': 'балончик',
-    # Побутова техніка (для точного збігу з BeLife Ceramic)
     'мікрохвильовка': 'мікрохвильов', 'мікрохвильовки': 'мікрохвильов', 'мікрохвильовкі': 'мікрохвильов',
     'микроволновка': 'мікрохвильов', 'микроволновки': 'мікрохвильов',
     'печі': 'печ', 'печь': 'печ', 'піч': 'печ', 'духовка': 'термостійк', 'камін': 'термостійк',
-    # 3D-друк
     'филамент': 'філамент', 'нитка': 'філамент', 'пластик': 'філамент',
-    # Герметики та піна
     'герметика': 'герметик', 'герметику': 'герметик', 'силикон': 'силікон',
     'піни': 'пін', 'піну': 'пін', 'пена': 'пін',
-    # Розчинники
     'растворитель': 'розчинник', 'розчинника': 'розчинник', 'сольвенту': 'сольвент',
     'уайтспірит': 'уайт-спірит', 'спирит': 'уайт-спірит', 'калоша': 'нефрас'
 }
 
 COLORS = {'білий', 'чорний', 'прозорий', 'сірий', 'червоний', 'синій', 'зелений', 'жовтий', 'золото', 'срібло'}
+STEMS = ('епоксид', 'метал', 'бетон', 'дерев', 'ванн', 'фарб', 'герметик',
+         'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал', 'гумов',
+         'термостійк', 'мікрохвильов', 'печ', 'керамік', 'акваріум')
 
 def fix_layout_if_needed(text: str) -> str:
-    """Виправляє текст, якщо клієнт набрав запит у неправильній розкладці (наприклад, uevjdf -> гумова)."""
     raw_lower = text.strip().lower()
-    # Якщо набрано англійськими літерами, але це не артикули і не специфічні терміни
-    if re.search(r'[a-z]{3,}', raw_lower) and not any(w in raw_lower for w in ('pla', 'petg', 'abs', 'tpu', 'belife', 'rino', 'hercul', 'sunlu')):
+    if re.search(r'[a-z]{3,}', raw_lower) and not any(w in raw_lower for w in ('pla', 'petg', 'abs', 'tpu', 'belife', 'rino', 'hercul', 'sunlu', 'ml', 'кг', 'гр')):
         converted = text.translate(ENG_TO_UKR)
-        # Якщо після конвертації з'явилися типові українські літери
         if re.search(r'[а-яіїєґ]', converted.lower()):
             return converted
     return text
@@ -78,7 +72,6 @@ def clean(value, length=4000):
     return re.sub(r'\s+', ' ', html.unescape(re.sub(r'<[^>]*>', ' ', str(value or ''))))[:length].strip()
 
 def normalize_code(val: str) -> str:
-    """Очищення артикулів: видаляє дефіси, пробіли, зводить візуально схожі літери до латиниці."""
     s = str(val).strip().casefold().replace('-', '').replace(' ', '').replace('_', '')
     trans = str.maketrans('асрокемітх', 'acpokemitx')
     return s.translate(trans)
@@ -91,9 +84,7 @@ def tokens(text):
         if word in STOP or len(word) < 2:
             continue
         word = ALIASES.get(word, word)
-        for stem in ('епоксид', 'метал', 'бетон', 'дерев', 'ванн', 'фарб', 'герметик',
-                     'силікон', 'філамент', 'розчинник', 'грунт', 'пін', 'емал', 'гумов',
-                     'термостійк', 'мікрохвильов', 'печ', 'керамік', 'акваріум'):
+        for stem in STEMS:
             if word.startswith(stem):
                 word = stem
                 break
@@ -120,8 +111,11 @@ class Catalog:
         self.products = {}
         self.updated_at = 0.0
         self.last_error = None
+        
+        # Індекс для швидкого семантичного пошуку
         self._indexed_products = None
         self._index = []
+        
         self.lock = asyncio.Lock()
         self.snapshot = Path(settings.db_path).parent / 'catalog-snapshot.json'
         self.source_id = hashlib.sha256(
@@ -134,18 +128,15 @@ class Catalog:
 
     def parse_product(self, raw):
         pid, name = clean(raw.get('id'), 120), clean(raw.get('name'), 250)
-        if not pid or not name:
-            raise ValueError('Product needs id and name')
+        if not pid or not name: raise ValueError('Product needs id and name')
 
         curr = str(raw.get('currency', raw.get('currencyId', 'UAH'))).upper()
-        if curr != 'UAH':
-            raise ValueError(f'Only UAH is supported (got {curr})')
+        if curr != 'UAH': raise ValueError(f'Only UAH is supported (got {curr})')
 
         try:
             raw_p = raw.get('price')
             price_val = Decimal(str(raw_p).replace(' ', '').replace(',', '.')) if raw_p is not None and str(raw_p).strip() != '' else Decimal(0)
-            if not price_val.is_finite() or price_val < 0 or price_val > 10000000:
-                raise ValueError('Invalid price')
+            if not price_val.is_finite() or price_val < 0 or price_val > 10000000: raise ValueError('Invalid price')
             price = str(price_val.quantize(Decimal('0.01'))) if price_val > 0 else None
         except (KeyError, InvalidOperation):
             raise ValueError('Invalid product price') from None
@@ -156,31 +147,22 @@ class Catalog:
             raise ValueError(f'Product URL must belong to the configured shop: {url}')
 
         available = raw.get('available', False)
-        if available in (True, 'true', '1', 1, 'yes', 'в наявності'):
-            available = True
-        elif available in (False, 'false', '0', 0, None, '', 'немає в наявності'):
-            available = False
-        else:
-            raise ValueError('Invalid available flag')
+        if available in (True, 'true', '1', 1, 'yes', 'в наявності'): available = True
+        elif available in (False, 'false', '0', 0, None, '', 'немає в наявності'): available = False
+        else: raise ValueError('Invalid available flag')
 
         attrs = raw.get('attributes', {})
-        if not isinstance(attrs, dict):
-            raise ValueError('attributes must be an object')
+        if not isinstance(attrs, dict): raise ValueError('attributes must be an object')
 
         return Product(
-            pid,
-            name,
-            price,
-            available and (price is not None),
-            url,
+            pid, name, price, available and (price is not None), url,
             clean(raw.get('vendor_code', raw.get('vendorCode', '')), 120),
             clean(raw.get('description', '')),
             {clean(k, 80): clean(v, 500) for k, v in list(attrs.items())[:40]}
         )
 
     def decode(self, content):
-        if len(content) > MAX_BYTES:
-            raise ValueError('Catalog is too large')
+        if len(content) > MAX_BYTES: raise ValueError('Catalog is too large')
 
         if content.lstrip().startswith(b'<'):
             root = ElementTree.fromstring(content)
@@ -203,9 +185,8 @@ class Catalog:
         products = {}
         for raw in raws:
             p = self.parse_product(raw)
-            if p.id in products:
-                continue
-            products[p.id] = p
+            if p.id not in products:
+                products[p.id] = p
         return products
 
     async def read_remote(self):
@@ -217,15 +198,14 @@ class Catalog:
         if not addresses or any(not ipaddress.ip_address(x[4][0]).is_global for x in addresses):
             raise ValueError('Private catalog destinations are prohibited')
 
-        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+        headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 ABV-Agent'}
         async with httpx.AsyncClient(timeout=35, follow_redirects=True) as client:
             async with client.stream('GET', self.settings.catalog_url, headers=headers) as r:
                 r.raise_for_status()
                 data = bytearray()
                 async for chunk in r.aiter_bytes():
                     data.extend(chunk)
-                    if len(data) > MAX_BYTES:
-                        raise ValueError('Catalog is too large')
+                    if len(data) > MAX_BYTES: raise ValueError('Catalog is too large')
                 return bytes(data)
 
     async def refresh(self):
@@ -236,10 +216,8 @@ class Catalog:
                     content = await self.read_remote()
                 elif self.settings.catalog_file:
                     path = Path(self.settings.catalog_file)
-                    if not path.is_file():
-                        raise FileNotFoundError(f"Catalog file not found: {path}")
-                    if path.stat().st_size > MAX_BYTES:
-                        raise ValueError('Catalog is too large')
+                    if not path.is_file(): raise FileNotFoundError(f"Catalog file not found: {path}")
+                    if path.stat().st_size > MAX_BYTES: raise ValueError('Catalog is too large')
                     source_time = path.stat().st_mtime
                     content = await asyncio.to_thread(path.read_bytes)
                 else:
@@ -267,22 +245,22 @@ class Catalog:
 
     def restore(self):
         try:
-            if not self.snapshot.is_file() or self.snapshot.stat().st_size > MAX_BYTES:
-                return
+            if not self.snapshot.is_file() or self.snapshot.stat().st_size > MAX_BYTES: return
             data = json.loads(self.snapshot.read_text(encoding='utf-8'))
-            if data.get('source_id') != self.source_id:
-                return
+            if data.get('source_id') != self.source_id: return
             self.products = self.decode(json.dumps(data['products']).encode())
             self.updated_at = float(data['updated_at'])
             log.info(f"Restored {len(self.products)} products from snapshot.")
         except Exception as e:
             log.warning(f"Snapshot restore bypassed: {e}")
 
-    def search(self, query, limit=4):
+    def search(self, query, limit=5):
+        """Оптимізований пошук з бальною системою ранжування."""
         clean_q = fix_layout_if_needed(query.strip())
         norm_q = normalize_code(clean_q)
+        if not norm_q: return []
 
-        # 1. Пошук за прямим збігом артикулу або ID товару
+        # 1. Швидкий пошук за точним артикулом / ID
         exact_matches = []
         for p in self.products.values():
             p_code = normalize_code(p.vendor_code) if p.vendor_code else ''
@@ -290,56 +268,67 @@ class Catalog:
             if norm_q and (norm_q in (p_id, p_code) or (len(norm_q) >= 4 and (norm_q == p_code.lstrip('0') or norm_q in p_code))):
                 exact_matches.append(p)
         if exact_matches:
-            return exact_matches[:limit]
+            return sorted(exact_matches, key=lambda x: x.available, reverse=True)[:limit]
 
-        # 2. Токенізація запиту
+        # 2. Семантичний / Лексичний пошук
         words = tokens(clean_q)
-        if not words:
-            return []
+        if not words: return []
 
-        def matches(word, term):
-            if len(word) <= 3 or len(term) <= 3:
-                return word == term
-            return term.startswith(word) or word.startswith(term)
-
+        # Кешування індексу (Використання Set для швидких перетинів)
         if self._indexed_products is not self.products:
-            self._index = [
-                (
-                    p,
-                    tokens(p.name + ' ' + p.vendor_code),
-                    tokens(p.description),
-                    tokens(' '.join(f'{k} {v}' for k, v in p.attributes.items()))
-                )
-                for p in self.products.values()
-            ]
+            self._index = []
+            for p in self.products.values():
+                name_set = set(tokens(p.name + ' ' + p.vendor_code))
+                attr_set = set(tokens(' '.join(f'{k} {v}' for k, v in p.attributes.items())))
+                desc_set = set(tokens(p.description))
+                self._index.append((p, name_set, attr_set, desc_set))
             self._indexed_products = self.products
 
         ranked = []
-        for p, name_tokens, desc_tokens, attr_tokens in self._index:
-            matched_name = [w for w in words if any(matches(w, t) for t in name_tokens)]
-            matched_attr = [w for w in words if any(matches(w, t) for t in attr_tokens)]
-            matched_desc = [w for w in words if any(matches(w, t) for t in desc_tokens)]
+        for p, name_set, attr_set, desc_set in self._index:
+            score = 0
+            matched_words = 0
+            
+            for w in words:
+                # Гнучкий метчинг (дозволяє знайти "фарб" у "фарба")
+                is_name = any(w in t or t in w for t in name_set)
+                is_attr = any(w in t or t in w for t in attr_set)
+                is_desc = any(w in t or t in w for t in desc_set)
+                
+                if is_name:
+                    score += 15
+                    matched_words += 1
+                elif is_attr:
+                    score += 8
+                    matched_words += 1
+                elif is_desc:
+                    score += 2
+                    matched_words += 1
 
-            matched_all = list(dict.fromkeys(matched_name + matched_attr + matched_desc))
-            if not matched_all:
+            if matched_words == 0:
                 continue
 
-            # Сувора перевірка на тип філаменту для 3D-друку
-            required_types = [w for w in words if w in ('pla', 'petg', 'pet', 'abs', 'asa', 'tpu')]
-            if required_types and not all(any(matches(w, t) for t in name_tokens) for w in required_types):
+            # Сувора перевірка на тип філаменту (уникає показу PETG, коли шукають PLA)
+            req_3d = [w for w in words if w in ('pla', 'petg', 'abs', 'tpu')]
+            if req_3d and not all(any(w in t for t in name_set) for w in req_3d):
                 continue
 
-            # Розрахунок балів релевантності:
-            score = (len(matched_name) * 12) + (len(matched_attr) * 6) + (len(matched_desc) * 1)
+            # Штраф за низьке покриття запиту (показуємо лише якщо збіглося > 50% ключових слів)
+            coverage = matched_words / len(words)
+            if coverage < 0.4 and len(words) > 1:
+                continue
 
-            # Пріоритет за збіг за специфічними категоріями або кольором
-            specific_keys = [w for w in words if w in ('мікрохвильов', 'ванн', 'печ', 'керамік', 'гумов', 'акваріум') or w in COLORS]
-            if specific_keys and any(any(matches(sk, t) for t in name_tokens + attr_tokens) for sk in specific_keys):
-                score += 20
+            # Бонус за специфічні категорії (щоб фарба не перебивала мікрохвильовки)
+            specific_keys = [w for w in words if w in ('мікрохвильов', 'ванн', 'печ', 'керамік', 'гумов') or w in COLORS]
+            if specific_keys and any(sk in name_set for sk in specific_keys):
+                score += 25
 
-            # Бонус за наявність товару на складі
+            # Бонус за наявність та сортування
             if p.available:
-                score += 15
+                score += 10
 
-            # Коефіцієнт покриття слів запиту
-            coverage = len
+            ranked.append((score, p))
+
+        # Повертаємо топ N результатів, відсортованих за балами (score)
+        ranked.sort(key=lambda x: x[0], reverse=True)
+        return [p for score, p in ranked[:limit]]
