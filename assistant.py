@@ -18,7 +18,7 @@ SYSTEM = '''Ти AI-консультант інтернет-магазину б�
 Єдине джерело тверджень про конкретні товари — надані facts. Не вигадуй характеристик, сумісності,
 пропорцій змішування чи витрати, якщо їх немає в facts.
 Ціни, посилання і наявність показуються окремими серверними картками: не дублюй ціни вручну в тексті.
-Якщо клієнт шукає специфічні покриття (ванни, радіатори, мікрохвильові печі, гумова фарба, покрівля), пропонуй лише ті варіанти з facts, у яких це зазначено в назві чи описі.
+Якщо клієнт шукає специфічні покриття (ванни, радіатори, мікрохвильові печі, гумова фарба, термостійкі матеріали), пропонуй лише ті варіанти з facts, у яких це зазначено в назві чи описі.
 Якщо в facts є відповідні товари — обов'язково коротко опиши їх застосування і поверни їхні id у product_ids.
 Не давай порад зі змішування побутової хімії чи іншого небезпечного застосування.
 
@@ -62,7 +62,6 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
         "User-Agent": "ABV-AI-Assistant/3.0"
     }
 
-    # Прямі URL-запити для пошуку заявки
     urls_to_try = []
     if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
         urls_to_try.append(f"{base_url}?filter[externalId]={query_str}")
@@ -87,7 +86,6 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         internal_id = m.get("id")
                         ext_id = m.get("externalId") or internal_id or query_str
 
-                        # Якщо в базовому списку ТТН не знайдено, робимо запит за повною карткою заявки
                         full_card_data = {}
                         if internal_id:
                             try:
@@ -98,16 +96,13 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                             except Exception as sub_e:
                                 log.warning(f"Error fetching full order details: {sub_e}")
 
-                        # Об'єднуємо всі отримані дані в один JSON-рядок для гарантованого вилучення ТТН
                         combined_dump = json.dumps([m, full_card_data], ensure_ascii=False)
 
-                        # Експрес-накладна Нової Пошти: 14 цифр, що починаються з 204, 59, 10, 205 тощо
                         ttn = ""
                         ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', combined_dump)
                         if ttn_match:
                             ttn = ttn_match.group(1)
 
-                        # Визначення статусу
                         st = m.get("status") or full_card_data.get("status")
                         if isinstance(st, dict):
                             st_name = st.get("text", "В обробці")
@@ -122,7 +117,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         if order_date and "T" in str(order_date):
                             order_date = str(order_date).split("T")[0]
 
-                        log.info(f"SalesDrive успішно знайдено: externalId={ext_id}, status={st_name}, ttn={ttn}")
+                        log.info(f"SalesDrive знайдено: ext_id={ext_id}, status={st_name}, ttn={ttn}")
                         return {
                             "found": True,
                             "order_id": ext_id,
@@ -144,6 +139,8 @@ def retrieval_query(message, history):
         extra = " ceramic реставрація ванн"
     elif any(k in q_lower for k in ("гумов", "резинов")):
         extra = " гумова фарба покрівля"
+    elif any(k in q_lower for k in ("термостійк", "високотемператур", "герметик")):
+        extra = " термостійкий герметик силікон камін піч"
 
     current = tokens(message + extra)
     context = [h['text'] for h in history[-8:] if h['role'] == 'user'][-3:]
@@ -160,6 +157,7 @@ def fallback(message, items):
         elif 'філамент' in q or '3d' in q: question = 'Який тип пластику й колір потрібні?'
         elif re.search(r'мікрохвильов|микроволнов', q): question = 'Потрібно пофарбувати корпус ззовні чи внутрішню камеру?'
         elif re.search(r'гумов|резинов', q): question = 'Для якої поверхні потрібна гумова фарба (дах, фасад, цоколь чи бетон)?'
+        elif re.search(r'термо|піч|камін|герметик', q): question = 'Яка максимальна температура очікується та де саме будете герметизувати?'
         elif re.search(r'метал|дерев|бетон|пласт|скл|стін|підлог', q): question = 'Це роботи всередині приміщення чи на вулиці?'
         return 'Знайшов відповідні товари за вашим запитом — перегляньте картки нижче. ' + question
     return 'Не знайшов точного збігу в каталозі за цим запитом. Уточніть назву або артикул товару чи залиште заявку менеджеру.'
@@ -180,7 +178,7 @@ class Assistant:
                 'handoff': True
             }
 
-        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ (якщо є маркери або літери в номері)
+        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ
         is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
         has_letters_sku = bool(re.search(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+|[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
         
@@ -289,48 +287,90 @@ class Assistant:
             reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
             handoff = True
 
-        used_ai = False
-        if items and self.settings.gemini_key and self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
-            result = await self.generate(message, history, items)
-            if result:
-                reply, ids, handoff = result
-                matched_items = [p for p in items if p.id in ids]
-                items = matched_items if matched_items else items[:3]
-                used_ai = True
+        # Виклик генерації з обов'язковим перехопленням будь-яких помилок (щоб ніколи не повертати 500)
+        if items and self.settings.gemini_key:
+            try:
+                if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
+                    result = await self.generate(message, history, items)
+                    if result:
+                        ai_reply, ids, ai_handoff = result
+                        matched_items = [p for p in items if p.id in ids]
+                        items = matched_items if matched_items else items[:3]
+                        reply = ai_reply
+                        handoff = ai_handoff
+            except Exception as e:
+                log.warning(f"AI response generation failed, falling back to catalog template: {e}")
 
         return {'reply': reply, 'products': [p.public() for p in items], 'handoff': handoff}
 
     async def generate(self, message, history, items):
-        if not re.fullmatch(r'[A-Za-z0-9._-]+', self.settings.gemini_model):
-            return None
-        facts = [{'id': p.id, 'name': p.name, 'description': p.description[:1600], 'attributes': p.attributes} for p in items]
+        # Формування безпечних фактів про товар
+        facts = []
+        for p in items[:4]:
+            attrs = p.attributes if isinstance(p.attributes, dict) else {}
+            facts.append({
+                'id': str(p.id),
+                'name': str(p.name),
+                'description': str(p.description or '')[:1400],
+                'attributes': {str(k)[:60]: str(v)[:250] for k, v in list(attrs.items())[:25]}
+            })
+
         payload = {
             'facts': facts,
-            'history': [{'role': h['role'], 'text': redact(h['text'])[:700]} for h in history[-8:]],
-            'message': redact(message)
+            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:600]} for h in history[-6:]],
+            'message': redact(str(message))
         }
+
+        # Перевірка назви моделі
+        model_name = (self.settings.gemini_model or 'gemini-2.5-flash').strip()
+        if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name):
+            model_name = 'gemini-2.5-flash'
+
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}],
-            'generationConfig': {'temperature': 0.1, 'maxOutputTokens': 800, 'responseMimeType': 'application/json'}
+            'generationConfig': {
+                'temperature': 0.1,
+                'maxOutputTokens': 800,
+                'responseMimeType': 'application/json'
+            }
         }
+
         try:
             async with asyncio.timeout(12):
                 async with self.semaphore, httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
                     response = await client.post(
-                        f'https://generativelanguage.googleapis.com/v1beta/models/{self.settings.gemini_model}:generateContent',
+                        f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
                         headers={'x-goog-api-key': self.settings.gemini_key},
                         json=body
                     )
-                    response.raise_for_status()
+                    if response.status_code != 200:
+                        log.warning(f"Gemini API returned status {response.status_code}: {response.text}")
+                        return None
+
                     data = response.json()
-                    parts = data['candidates'][0]['content']['parts']
-                    result = json.loads(''.join(p.get('text', '') for p in parts))
+                    candidates = data.get('candidates', [])
+                    if not candidates:
+                        return None
+
+                    parts = candidates[0].get('content', {}).get('parts', [])
+                    raw_text = ''.join(p.get('text', '') for p in parts).strip()
+                    if not raw_text:
+                        return None
+
+                    # Очищення від можливих markdown-тегів ```json ... ```
+                    if raw_text.startswith('```'):
+                        raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
+                        raw_text = re.sub(r'\s*```$', '', raw_text)
+
+                    result = json.loads(raw_text)
                     text = str(result.get('text', '')).strip()
                     ids = result.get('product_ids', [])
                     allowed = {p.id for p in items}
-                    if not text or len(text) > 3000 or not isinstance(ids, list):
+
+                    if not text or not isinstance(ids, list):
                         return None
+
                     return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
         except Exception as e:
             log.warning(f'AI model response unavailable, using catalog fallback: {e}')
