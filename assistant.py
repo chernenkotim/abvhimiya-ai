@@ -193,7 +193,7 @@ def fallback(message, items):
 class Assistant:
     def __init__(self, settings, store, catalog):
         self.settings, self.store, self.catalog = settings, store, catalog
-        self.semaphore = asyncio.Semaphore(4)
+        self.semaphore = asyncio.Semaphore(5)
 
     def _get_all_products(self) -> list:
         """Універсальне отримання списку всіх товарів з каталогу."""
@@ -335,7 +335,7 @@ class Assistant:
                         p_desc = str(getattr(p, 'description', '')).casefold()
                         if any(k in p_name or k in p_desc for k in keywords):
                             items.append(p)
-                        if len(items) >= 4:
+                        if len(items) >= 6:
                             break
 
             reply = fallback(message, items)
@@ -349,12 +349,12 @@ class Assistant:
                         if result:
                             ai_reply, ids, ai_handoff = result
                             matched_items = [p for p in items if str(getattr(p, 'id', '')).strip() in ids]
-                            if matched_items:
-                                items = matched_items
+                            # Якщо AI підібрав конкретні товари зі списку — показуємо їх, інакше перші доступні
+                            items = matched_items if matched_items else items[:4]
                             reply = ai_reply
                             handoff = ai_handoff
                 except Exception as ai_e:
-                    log.warning(f"AI generation failed: {ai_e}")
+                    log.warning(f"AI generation call failed: {ai_e}", exc_info=True)
 
             return {
                 'reply': reply,
@@ -371,23 +371,25 @@ class Assistant:
             }
 
     async def generate(self, message, history, items):
+        # Відбираємо до 4 товарів збалансовано (щоб при порівнянні потрапляли обидва матеріали)
         facts = []
-        for p in items[:3]:
+        for p in items[:4]:
             attrs = getattr(p, 'attributes', {})
             attrs_dict = attrs if isinstance(attrs, dict) else {}
             facts.append({
-                'id': str(getattr(p, 'id', '')),
+                'id': str(getattr(p, 'id', '')).strip(),
                 'name': str(getattr(p, 'name', '')),
-                'description': str(getattr(p, 'description', '') or '')[:500],
-                'attributes': {str(k)[:40]: str(v)[:150] for k, v in list(attrs_dict.items())[:8]}
+                'description': str(getattr(p, 'description', '') or '')[:400],
+                'attributes': {str(k)[:40]: str(v)[:120] for k, v in list(attrs_dict.items())[:6]}
             })
 
         payload = {
             'facts': facts,
-            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:300]} for h in history[-4:]],
+            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:250]} for h in history[-3:]],
             'message': redact(str(message))
         }
 
+        # Актуальна робоча модель Google Gemini
         model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
         if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name) or '2.5' in model_name:
             model_name = 'gemini-3.8-flash'
@@ -403,8 +405,9 @@ class Assistant:
         }
 
         try:
-            async with asyncio.timeout(18):
-                async with self.semaphore, httpx.AsyncClient(timeout=16, follow_redirects=False) as client:
+            # 22 секунди таймаут для стабільної роботи мережі
+            async with asyncio.timeout(22):
+                async with self.semaphore, httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
                     response = await client.post(
                         f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
                         headers={'x-goog-api-key': self.settings.gemini_key},
@@ -430,7 +433,7 @@ class Assistant:
 
                     result = json.loads(raw_text, strict=False)
                     text = str(result.get('text', '')).strip()
-                    ids = [str(x).strip() for x in result.get('product_ids', [])]
+                    ids = [str(x).strip() for x in result.get('product_ids', []) if x]
                     allowed = {str(getattr(p, 'id', '')).strip() for p in items}
 
                     if not text:
@@ -438,5 +441,6 @@ class Assistant:
 
                     return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
         except Exception as e:
-            log.warning(f'AI model response unavailable, using catalog fallback: {e}')
+            err_name = type(e).__name__
+            log.warning(f'AI model response unavailable ({err_name}: {repr(e)}), using catalog fallback')
             return None
