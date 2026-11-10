@@ -12,9 +12,9 @@ from uuid import UUID
 import weakref
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, Header, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, field_validator
@@ -152,7 +152,7 @@ def create_app(settings=None):
         widget = request.url.path in ('/widget', '/')
         ancestors = ' '.join(("'self'", *settings.parent_origins)) if widget else "'none'"
         response.headers.update({
-            'Content-Security-Policy': f"default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; frame-ancestors {ancestors}; base-uri 'none'; object-src 'none'",
+            'Content-Security-Policy': f"default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' https: data:; connect-src 'self'; frame-ancestors {ancestors}; base-uri 'none'; object-src 'none'",
             'X-Content-Type-Options': 'nosniff',
             'Referrer-Policy': 'no-referrer',
             'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
@@ -168,11 +168,11 @@ def create_app(settings=None):
 
     def limit(request, kind, session_val=None):
         rules = [
-            ('ip:' + ip_key(request), 90, 60),
-            ('ip:' + kind + ':' + ip_key(request), {'session': 20, 'chat': 40, 'lead': 10, 'admin': 40}.get(kind, 30), 60)
+            ('ip:' + ip_key(request), 120, 60),
+            ('ip:' + kind + ':' + ip_key(request), {'session': 25, 'chat': 50, 'lead': 15, 'admin': 60}.get(kind, 40), 60)
         ]
         if session_val:
-            rules.append(('session:' + kind + ':' + session_val, {'chat': 35, 'lead': 8}.get(kind, 30), 60))
+            rules.append(('session:' + kind + ':' + session_val, {'chat': 40, 'lead': 10}.get(kind, 35), 60))
         if not store.allow(rules): 
             raise HTTPException(429, 'Забагато запитів. Спробуйте за хвилину.', headers={'Retry-After': '60'})
 
@@ -195,12 +195,10 @@ def create_app(settings=None):
         except (ValueError, TypeError): 
             raise HTTPException(403, 'Сесія недійсна або завершилася', headers={'X-Session-Expired': '1'})
 
-    async def admin_auth(request: Request, authorization: str = Header(default='')):
-        import hmac
+    # Вхід до кабінету без пароля (залишається лише лімітер запитів)
+    async def admin_auth(request: Request):
         limit(request, 'admin')
-        token = authorization.replace('Bearer ', '').strip() if authorization.startswith('Bearer ') else ''
-        if not settings.admin_token or not hmac.compare_digest(token, settings.admin_token):
-            raise HTTPException(401, 'Потрібна авторизація', headers={'WWW-Authenticate': 'Bearer'})
+        return True
 
     @app.get('/')
     @app.get('/widget')
@@ -268,11 +266,11 @@ def create_app(settings=None):
         async with lock:
             history = store.history(uid)
             clean_msg = redact(message)
-            store.save_history(uid, history + [{'role': 'user', 'text': clean_msg}])
             
-            # Виклик асистента
+            # Виклик асистента з поточною історією
             answer = await assistant.answer(clean_msg, history)
             
+            # Збереження оновленої історії без дублювання
             store.save_history(uid, history + [
                 {'role': 'user', 'text': clean_msg},
                 {
@@ -371,7 +369,6 @@ async def send_telegram(settings, lead_obj):
     data = lead_obj['payload']
     product = data.get('product')
     
-    # Екранування HTML-символів для уникнення помилок парсингу Telegram
     lead_id_safe = html.escape(str(lead_obj['id']))
     name_safe = html.escape(data.get('name') or 'Не вказано')
     phone_safe = html.escape(str(data.get('phone', '')))
