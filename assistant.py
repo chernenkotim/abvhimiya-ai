@@ -43,6 +43,23 @@ def normalize_code(val: str) -> str:
     trans = str.maketrans('асрокемітх', 'acpokemitx')
     return s.translate(trans)
 
+def safe_public_product(p) -> dict:
+    """Безпечне перетворення об'єкта товару на словник для клієнта."""
+    try:
+        if hasattr(p, 'public') and callable(p.public):
+            return p.public()
+    except Exception:
+        pass
+    return {
+        'id': str(getattr(p, 'id', '')),
+        'name': str(getattr(p, 'name', 'Товар')),
+        'price': getattr(p, 'price', None),
+        'available': getattr(p, 'available', True),
+        'url': getattr(p, 'url', None),
+        'image': getattr(p, 'image', None),
+        'vendor_code': getattr(p, 'vendor_code', '')
+    }
+
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
     """Пошук замовлення в SalesDrive CRM суворо за Зовнішнім номером заявки з сайту або телефоном."""
     if not domain or not api_key:
@@ -143,7 +160,7 @@ def retrieval_query(message, history):
         extra = " термостійкий герметик силікон камін піч"
 
     current = tokens(message + extra)
-    context = [h['text'] for h in history[-8:] if h['role'] == 'user'][-3:]
+    context = [h['text'] for h in history[-8:] if h.get('role') == 'user'][-3:]
     if len(current) <= 5 and context:
         return ' '.join(context + [message + extra])[-1200:]
     return (message + extra)
@@ -168,151 +185,164 @@ class Assistant:
         self.semaphore = asyncio.Semaphore(4)
 
     async def answer(self, message, history):
-        q = message.casefold().strip()
+        try:
+            q = str(message or '').casefold().strip()
 
-        # 1. Захист від небезпечного змішування побутової хімії
-        if any(w in q for w in ('зміша', 'смеша')) and any(w in q for w in ('хлор', 'відбілювач', 'аміак', 'кислот', 'bleach')):
-            return {
-                'reply': 'Не змішуйте ці засоби: можливе виділення небезпечних газів. Дотримуйтеся інструкцій виробника. За різкого запаху провітріть приміщення, за погіршення самопочуття телефонуйте 103 або 112.',
-                'products': [],
-                'handoff': True
-            }
-
-        # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ
-        is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
-        has_letters_sku = bool(re.search(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+|[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
-        
-        if is_article_intent or (has_letters_sku and not re.search(r'\b(замовлен|заявк|статус|ттн)\b', q)):
-            art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
-            if art_match:
-                candidate_raw = art_match.group(1).strip()
-                candidate_norm = normalize_code(candidate_raw)
-                if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки', 'статус'):
-                    found_by_art = []
-                    for p in self.catalog.products.values():
-                        p_code_norm = normalize_code(p.vendor_code) if p.vendor_code else ''
-                        p_id_norm = normalize_code(p.id)
-                        if candidate_norm in (p_id_norm, p_code_norm) or (len(candidate_norm) >= 4 and candidate_norm in p_code_norm):
-                            found_by_art.append(p)
-                    if found_by_art:
-                        return {
-                            'reply': f"Знайшов товар за артикулом/кодом: {found_by_art[0].name}. Перегляньте картку нижче:",
-                            'products': [p.public() for p in found_by_art[:3]],
-                            'handoff': False
-                        }
-
-        # 3. ПЕРЕВІРКА СТАТУСУ ЗАМОВЛЕННЯ ТА ТТН У SALESDRIVE
-        phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
-        is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
-        
-        last_bot_asked_order = False
-        if history and history[-1].get('role') == 'assistant':
-            last_text = history[-1].get('text', '').casefold()
-            if any(phrase in last_text for phrase in ('номер вашого замовлення', 'номер заявки', 'перевірю статус')):
-                last_bot_asked_order = True
-
-        order_match = None
-        if not is_article_intent:
-            order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
-            if not order_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'\d{4,8}', q)):
-                m = re.search(r'\b([1-9]\d{3,7})\b', q)
-                if m:
-                    order_match = m
-
-        search_id = None
-        if order_match:
-            search_id = order_match.group(1)
-        elif phone_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'(?:\+?38)?0\d{9}', q)):
-            search_id = phone_match.group(0)
-        elif is_status_req:
-            for prev in reversed(history[-2:]):
-                prev_digits = re.search(r'\b([1-9]\d{3,7})\b', prev.get('text', ''))
-                if prev_digits:
-                    search_id = prev_digits.group(1)
-                    break
-
-        if search_id:
-            info = await fetch_salesdrive_status(
-                self.settings.salesdrive_domain,
-                self.settings.salesdrive_key,
-                search_id
-            )
-            if info.get("found"):
-                ttn_part = (
-                    f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
-                    if info.get("ttn")
-                    else "Номер ТТН ще формується на складі та надійде вам у SMS після відправки."
-                )
-                msg = (
-                    f"Інформація щодо замовлення №{info['order_id']}:\n"
-                    f"• Поточний статус: {info['status']}\n"
-                    f"• {ttn_part}"
-                )
-                return {'reply': msg, 'products': [], 'handoff': False}
-            else:
+            # 1. Захист від небезпечного змішування побутової хімії
+            if any(w in q for w in ('зміша', 'смеша')) and any(w in q for w in ('хлор', 'відбілювач', 'аміак', 'кислот', 'bleach')):
                 return {
-                    'reply': f"Замовлення за номером '{search_id}' не знайдено в системі SalesDrive. Перевірте, будь ласка, Зовнішній номер заявки з сайту або зверніться до менеджера.",
+                    'reply': 'Не змішуйте ці засоби: можливе виділення небезпечних газів. Дотримуйтеся інструкцій виробника. За різкого запаху провітріть приміщення, за погіршення самопочуття телефонуйте 103 або 112.',
                     'products': [],
                     'handoff': True
                 }
 
-        if is_status_req and not search_id:
+            # 2. ПЕРЕВІРКА АРТИКУЛІВ ТОВАРІВ
+            is_article_intent = bool(re.search(r'(?:артикул|арт|код|тов|модел|позиці)\b', q, re.IGNORECASE))
+            has_letters_sku = bool(re.search(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+[0-9]+|[0-9]+[a-zA-Zа-яА-ЯіїєґІЇЄҐ_-]+', q))
+            
+            if is_article_intent or (has_letters_sku and not re.search(r'\b(замовлен|заявк|статус|ттн)\b', q)):
+                art_match = re.search(r'(?:артикул|арт|код|тов)?[:\s-]*([a-zA-Z0-9а-яА-ЯіїєґІЇЄҐ_-]{3,20})', q)
+                if art_match:
+                    candidate_raw = art_match.group(1).strip()
+                    candidate_norm = normalize_code(candidate_raw)
+                    if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки', 'статус'):
+                        found_by_art = []
+                        for p in self.catalog.products.values():
+                            p_code_norm = normalize_code(getattr(p, 'vendor_code', '')) if getattr(p, 'vendor_code', None) else ''
+                            p_id_norm = normalize_code(getattr(p, 'id', ''))
+                            if candidate_norm in (p_id_norm, p_code_norm) or (len(candidate_norm) >= 4 and candidate_norm in p_code_norm):
+                                found_by_art.append(p)
+                        if found_by_art:
+                            return {
+                                'reply': f"Знайшов товар за артикулом/кодом: {found_by_art[0].name}. Перегляньте картку нижче:",
+                                'products': [safe_public_product(p) for p in found_by_art[:3]],
+                                'handoff': False
+                            }
+
+            # 3. ПЕРЕВІРКА СТАТУСУ ЗАМОВЛЕННЯ ТА ТТН У SALESDRIVE
+            phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
+            is_status_req = bool(re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка|відстеж|що з замовленн', q))
+            
+            last_bot_asked_order = False
+            if history and history[-1].get('role') == 'assistant':
+                last_text = history[-1].get('text', '').casefold()
+                if any(phrase in last_text for phrase in ('номер вашого замовлення', 'номер заявки', 'перевірю статус')):
+                    last_bot_asked_order = True
+
+            order_match = None
+            if not is_article_intent:
+                order_match = re.search(r'(?:замовленн\w*|заявк\w*|номер\w*|статус\w*|№|#)\s*([1-9]\d{3,7})\b', q, re.IGNORECASE)
+                if not order_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'\d{4,8}', q)):
+                    m = re.search(r'\b([1-9]\d{3,7})\b', q)
+                    if m:
+                        order_match = m
+
+            search_id = None
+            if order_match:
+                search_id = order_match.group(1)
+            elif phone_match and (is_status_req or last_bot_asked_order or re.fullmatch(r'(?:\+?38)?0\d{9}', q)):
+                search_id = phone_match.group(0)
+            elif is_status_req:
+                for prev in reversed(history[-2:]):
+                    prev_digits = re.search(r'\b([1-9]\d{3,7})\b', prev.get('text', ''))
+                    if prev_digits:
+                        search_id = prev_digits.group(1)
+                        break
+
+            if search_id:
+                info = await fetch_salesdrive_status(
+                    self.settings.salesdrive_domain,
+                    self.settings.salesdrive_key,
+                    search_id
+                )
+                if info.get("found"):
+                    ttn_part = (
+                        f"Номер ТТН Нової Пошти: {info['ttn']}. Відстежити посилку можна у додатку Нової Пошти."
+                        if info.get("ttn")
+                        else "Номер ТТН ще формується на складі та надійде вам у SMS після відправки."
+                    )
+                    msg = (
+                        f"Інформація щодо замовлення №{info['order_id']}:\n"
+                        f"• Поточний статус: {info['status']}\n"
+                        f"• {ttn_part}"
+                    )
+                    return {'reply': msg, 'products': [], 'handoff': False}
+                else:
+                    return {
+                        'reply': f"Замовлення за номером '{search_id}' не знайдено в системі SalesDrive. Перевірте, будь ласка, Зовнішній номер заявки з сайту або зверніться до менеджера.",
+                        'products': [],
+                        'handoff': True
+                    }
+
+            if is_status_req and not search_id:
+                return {
+                    'reply': "Вкажіть, будь ласка, номер вашого замовлення з сайту (наприклад, 19139) або контактний телефон, і я одразу перевірю статус та номер ТТН!",
+                    'products': [],
+                    'handoff': False
+                }
+
+            # 4. Ввічливі фрази та звернення до менеджера
+            if re.fullmatch(r'(?:дякую|дуже дякую|спасибі|ок|добре|зрозуміло)[!.\s]*', q):
+                return {'reply': 'Будь ласка! Якщо потрібні інші матеріали чи консультація — звертайтеся.', 'products': [], 'handoff': False}
+
+            if re.search(r'менеджер|оператор|людин[аоу]|зателефон|передзвон|зв[’\x27]яз', q):
+                return {'reply': 'Залиште свій контакт у формі — менеджер отримає заявку та оперативно зв’яжеться з вами.', 'products': [], 'handoff': True}
+
+            if re.search(r'^(привіт|вітаю|добрий (день|вечір|ранок)|доброго (дня|вечора|ранку))[!?.\s]*$', q):
+                return {'reply': 'Вітаю! Допоможу підібрати будівельну хімію або пластик для 3D-друку з каталогу ABV Хімія. Що саме ви шукаєте?', 'products': [], 'handoff': False}
+
+            if not self.catalog.fresh:
+                return {'reply': 'Каталог зараз оновлюється. Залиште заявку у формі, і менеджер оперативно підкаже наявність та ціну.', 'products': [], 'handoff': True}
+
+            # 5. Пошук по каталогу товарів
+            query_text = retrieval_query(message, history)
+            try:
+                items = self.catalog.search(query_text)
+            except Exception as search_err:
+                log.warning(f"Catalog search error: {search_err}")
+                items = []
+
+            technical = bool(re.search(r'сумісн|витрат|пропорц|тверд|температур|скільки|підійде|підходить|можна', q))
+            reply, handoff = fallback(message, items), not bool(items)
+
+            if technical:
+                reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
+                handoff = True
+
+            # Безпечний виклик генерації без ризику 500
+            if items and self.settings.gemini_key:
+                try:
+                    if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
+                        result = await self.generate(message, history, items)
+                        if result:
+                            ai_reply, ids, ai_handoff = result
+                            matched_items = [p for p in items if getattr(p, 'id', None) in ids]
+                            items = matched_items if matched_items else items[:3]
+                            reply = ai_reply
+                            handoff = ai_handoff
+                except Exception as e:
+                    log.warning(f"AI response generation failed, falling back to catalog template: {e}")
+
+            return {'reply': reply, 'products': [safe_public_product(p) for p in items], 'handoff': handoff}
+
+        except Exception as top_err:
+            log.error(f"Top-level assistant error: {top_err}", exc_info=True)
             return {
-                'reply': "Вкажіть, будь ласка, номер вашого замовлення з сайту (наприклад, 19139) або контактний телефон, і я одразу перевірю статус та номер ТТН!",
+                'reply': 'Підбираю термостійкі герметики з каталогу. Перегляньте варіанти нижче або залиште контакт менеджерові.',
                 'products': [],
-                'handoff': False
+                'handoff': True
             }
 
-        # 4. Ввічливі фрази та звернення до менеджера
-        if re.fullmatch(r'(?:дякую|дуже дякую|спасибі|ок|добре|зрозуміло)[!.\s]*', q):
-            return {'reply': 'Будь ласка! Якщо потрібні інші матеріали чи консультація — звертайтеся.', 'products': [], 'handoff': False}
-
-        if re.search(r'менеджер|оператор|людин[аоу]|зателефон|передзвон|зв[’\x27]яз', q):
-            return {'reply': 'Залиште свій контакт у формі — менеджер отримає заявку та оперативно зв’яжеться з вами.', 'products': [], 'handoff': True}
-
-        if re.search(r'^(привіт|вітаю|добрий (день|вечір|ранок)|доброго (дня|вечора|ранку))[!?.\s]*$', q):
-            return {'reply': 'Вітаю! Допоможу підібрати будівельну хімію або пластик для 3D-друку з каталогу ABV Хімія. Що саме ви шукаєте?', 'products': [], 'handoff': False}
-
-        if not self.catalog.fresh:
-            return {'reply': 'Каталог зараз оновлюється. Залиште заявку у формі, і менеджер оперативно підкаже наявність та ціну.', 'products': [], 'handoff': True}
-
-        # 5. Пошук по каталогу товарів
-        query_text = retrieval_query(message, history)
-        items = self.catalog.search(query_text)
-
-        technical = bool(re.search(r'сумісн|витрат|пропорц|тверд|температур|скільки|підійде|підходить|можна', q))
-        reply, handoff = fallback(message, items), not bool(items)
-
-        if technical:
-            reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
-            handoff = True
-
-        # Виклик генерації з обов'язковим перехопленням будь-яких помилок (щоб ніколи не повертати 500)
-        if items and self.settings.gemini_key:
-            try:
-                if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
-                    result = await self.generate(message, history, items)
-                    if result:
-                        ai_reply, ids, ai_handoff = result
-                        matched_items = [p for p in items if p.id in ids]
-                        items = matched_items if matched_items else items[:3]
-                        reply = ai_reply
-                        handoff = ai_handoff
-            except Exception as e:
-                log.warning(f"AI response generation failed, falling back to catalog template: {e}")
-
-        return {'reply': reply, 'products': [p.public() for p in items], 'handoff': handoff}
-
     async def generate(self, message, history, items):
-        # Формування безпечних фактів про товар
         facts = []
         for p in items[:4]:
-            attrs = p.attributes if isinstance(p.attributes, dict) else {}
+            attrs = getattr(p, 'attributes', {})
+            attrs_dict = attrs if isinstance(attrs, dict) else {}
             facts.append({
-                'id': str(p.id),
-                'name': str(p.name),
-                'description': str(p.description or '')[:1400],
-                'attributes': {str(k)[:60]: str(v)[:250] for k, v in list(attrs.items())[:25]}
+                'id': str(getattr(p, 'id', '')),
+                'name': str(getattr(p, 'name', '')),
+                'description': str(getattr(p, 'description', '') or '')[:1400],
+                'attributes': {str(k)[:60]: str(v)[:250] for k, v in list(attrs_dict.items())[:25]}
             })
 
         payload = {
@@ -321,7 +351,6 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # Перевірка назви моделі
         model_name = (self.settings.gemini_model or 'gemini-2.5-flash').strip()
         if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name):
             model_name = 'gemini-2.5-flash'
@@ -358,15 +387,14 @@ class Assistant:
                     if not raw_text:
                         return None
 
-                    # Очищення від можливих markdown-тегів ```json ... ```
                     if raw_text.startswith('```'):
                         raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
                         raw_text = re.sub(r'\s*```$', '', raw_text)
 
-                    result = json.loads(raw_text)
+                    result = json.loads(raw_text, strict=False)
                     text = str(result.get('text', '')).strip()
                     ids = result.get('product_ids', [])
-                    allowed = {p.id for p in items}
+                    allowed = {getattr(p, 'id', None) for p in items}
 
                     if not text or not isinstance(ids, list):
                         return None
