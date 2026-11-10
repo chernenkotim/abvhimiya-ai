@@ -151,19 +151,16 @@ def retrieval_query(message, history):
     q_lower = message.casefold()
     extra = ""
     if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "печ")):
-        extra = " ceramic мікрохвильових печей"
+        extra = " ceramic мікрохвильових"
     elif "ванн" in q_lower:
-        extra = " ceramic реставрація ванн"
+        extra = " ceramic ванн"
     elif any(k in q_lower for k in ("гумов", "резинов")):
-        extra = " гумова фарба покрівля"
-    elif any(k in q_lower for k in ("термостійк", "високотемператур", "герметик")):
-        extra = " термостійкий герметик силікон камін піч"
+        extra = " гумова"
+    elif any(k in q_lower for k in ("термо", "герметик", "високотемператур")):
+        extra = " термостійкий герметик"
 
-    current = tokens(message + extra)
-    context = [h['text'] for h in history[-8:] if h.get('role') == 'user'][-3:]
-    if len(current) <= 5 and context:
-        return ' '.join(context + [message + extra])[-1200:]
-    return (message + extra)
+    # Не роздуваємо запит десятками токенів, залишаємо чистий фокус
+    return f"{message} {extra}".strip()
 
 def fallback(message, items):
     if items:
@@ -296,20 +293,31 @@ class Assistant:
 
             # 5. Пошук по каталогу товарів
             query_text = retrieval_query(message, history)
+            items = []
             try:
                 items = self.catalog.search(query_text)
             except Exception as search_err:
                 log.warning(f"Catalog search error: {search_err}")
-                items = []
+
+            # Резервний пошук за входженням слів у назву (якщо основний індекс дав 0 товарів)
+            if not items and hasattr(self.catalog, 'products') and self.catalog.products:
+                keywords = [w for w in re.findall(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}', q) if w not in ('потрібен', 'треба', 'порадьте', 'шукаю')]
+                if keywords:
+                    for p in self.catalog.products.values():
+                        p_name_lower = str(getattr(p, 'name', '')).casefold()
+                        if any(k in p_name_lower for k in keywords):
+                            items.append(p)
+                        if len(items) >= 4:
+                            break
 
             technical = bool(re.search(r'сумісн|витрат|пропорц|тверд|температур|скільки|підійде|підходить|можна', q))
             reply, handoff = fallback(message, items), not bool(items)
 
-            if technical:
+            if technical and items:
                 reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
                 handoff = True
 
-            # Безпечний виклик генерації без ризику 500
+            # Безпечний виклик генерації AI
             if items and self.settings.gemini_key:
                 try:
                     if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
@@ -328,7 +336,7 @@ class Assistant:
         except Exception as top_err:
             log.error(f"Top-level assistant error: {top_err}", exc_info=True)
             return {
-                'reply': 'Підбираю термостійкі герметики з каталогу. Перегляньте варіанти нижче або залиште контакт менеджерові.',
+                'reply': 'Не вдалося завантажити картки за цим запитом. Спробуйте уточнити назву або зверніться до менеджера через форму.',
                 'products': [],
                 'handoff': True
             }
