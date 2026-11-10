@@ -10,21 +10,25 @@ from privacy import redact
 
 log = logging.getLogger(__name__)
 
-SYSTEM = '''Ти AI-консультант інтернет-магазину будівельної хімії та 3D-друку ABV Хімія (abvhimiya.com.ua).
-Спілкуйся природною українською, стисло й по суті.
+SYSTEM = '''Ти провідний AI-технолог і консультант інтернет-магазину будівельної хімії та 3D-друку ABV Хімія (abvhimiya.com.ua).
+Спілкуйся природною, професійною українською мовою, стисло, доброзичливо й експертно.
 
-ПРАВИЛА РОБОТИ З ТОВАРАМИ:
-Твоє завдання: допомогти вибрати товар і відповісти на запитання клієнта.
-Єдине джерело тверджень про конкретні товари — надані facts. Не вигадуй характеристик, сумісності,
-пропорцій змішування чи витрати, якщо їх немає в facts.
-Ціни, посилання і наявність показуються окремими серверними картками: не дублюй ціни вручну в тексті.
-Якщо клієнт шукає специфічні покриття (ванни, радіатори, мікрохвильові печі, гумова фарба, термостійкі матеріали), пропонуй лише ті варіанти з facts, у яких це зазначено в назві чи описі.
-Якщо в facts є відповідні товари — обов'язково коротко опиши їх застосування і поверни їхні id у product_ids.
-Не давай порад зі змішування побутової хімії чи іншого небезпечного застосування.
+ПРАВИЛА КОНСУЛЬТАЦІЇ ТА ПОРІВНЯННЯ:
+1. Загальні технічні та хімічні знання:
+   Якщо клієнт запитує про різницю між матеріалами (наприклад, нефрас чи уайт-спірит, типи герметиків, силіконів, епоксидні чи поліуретанові суміші, філаменти PLA/PETG) або сфери їх застосування:
+   - Надай чітке, експертне пояснення їхніх фізико-хімічних відмінностей (призначення, основа, леткість, швидкість випаровування, запах, сумісність із фарбами/поверхнями).
+   - Поясни простими словами, для якого саме завдання що краще обрати.
+2. Робота з товарами з каталогу (facts):
+   - Конкретні комерційні пропозиції (наявність, об'єм тари, артикули, сумісність конкретних банок) базуй на наданих facts.
+   - Обов'язково запропонуй відповідні позиції з facts, вказавши їхні id у масиві product_ids.
+   - Не вказуй ціни вручну в тексті (вони автоматично відображаються у веб-картках).
+3. Безпека:
+   - Заборонено давати поради щодо небезпечного змішування побутової та промислової хімії (хлор із кислотами/аміаком).
+   - Нагадуй про техніку безпеки при роботі з розчинниками та термостійкими герметиками (провітрювання, засоби захисту).
 
 ФОРМАТ ВІДПОВІДІ:
-Поверни строго валідний JSON: {"text":"відповідь", "product_ids":["id"], "handoff":false}.
-product_ids — лише id товарів із facts, які дійсно підходять (від 1 до 4 id).
+Поверни строго валідний JSON: {"text":"твоя експертна відповідь", "product_ids":["id"], "handoff":false}.
+product_ids — від 1 до 4 id товарів із facts, які найкраще підходять під запит.
 handoff=true встановлюй тоді, коли потрібне пряме втручання менеджера або точних характеристик немає.'''
 
 SALESDRIVE_STATUSES = {
@@ -166,6 +170,8 @@ def retrieval_query(message, history):
         extra = " гумова"
     elif any(k in q_lower for k in ("термо", "герметик", "високотемператур")):
         extra = " герметик термостійкий"
+    elif any(k in q_lower for k in ("нефрас", "уайт", "вайт", "розчинник", "растворител", "калош")):
+        extra = " нефрас уайт-спірит розчинник"
 
     return f"{message} {extra}".strip()
 
@@ -179,6 +185,7 @@ def fallback(message, items):
         elif re.search(r'мікрохвильов|микроволнов', q): question = 'Потрібно пофарбувати корпус ззовні чи внутрішню камеру?'
         elif re.search(r'гумов|резинов', q): question = 'Для якої поверхні потрібна гумова фарба (дах, фасад, цоколь чи бетон)?'
         elif re.search(r'термо|піч|камін|герметик', q): question = 'Яка максимальна температура очікується та де саме будете герметизувати?'
+        elif re.search(r'нефрас|уайт|розчинник|знежир', q): question = 'Вам потрібен розчинник для розведення фарби чи для якісного знежирення деталей?'
         elif re.search(r'метал|дерев|бетон|пласт|скл|стін|підлог', q): question = 'Це роботи всередині приміщення чи на вулиці?'
         return 'Знайшов відповідні товари за вашим запитом — перегляньте картки нижче. ' + question
     return 'Не знайшов точного збігу в каталозі за цим запитом. Уточніть назву або артикул товару чи залиште заявку менеджеру.'
@@ -189,7 +196,7 @@ class Assistant:
         self.semaphore = asyncio.Semaphore(4)
 
     def _get_all_products(self) -> list:
-        """Універсальне отримання списку всіх товарів з каталогу незалежно від його типу."""
+        """Універсальне отримання списку всіх товарів з каталогу."""
         prods = getattr(self.catalog, 'products', None)
         if prods is None:
             return []
@@ -311,7 +318,6 @@ class Assistant:
             items = []
             query_text = retrieval_query(message, history)
             
-            # Спроба 1: стандартний пошук каталогу
             try:
                 if hasattr(self.catalog, 'search') and callable(self.catalog.search):
                     raw_items = self.catalog.search(query_text)
@@ -320,11 +326,9 @@ class Assistant:
             except Exception as search_err:
                 log.warning(f"Catalog search error: {search_err}")
 
-            # Спроба 2: резервний прямий пошук за ключовими словами по всій базі
             if not items:
                 all_prods = self._get_all_products()
-                # Виділяємо значущі корені слів
-                keywords = [w for w in re.findall(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}', q) if w not in ('потрібен', 'треба', 'порадьте', 'шукаю', 'матеріал')]
+                keywords = [w for w in re.findall(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}', q) if w not in ('потрібен', 'треба', 'порадьте', 'шукаю', 'матеріал', 'різниця', 'чому')]
                 if keywords and all_prods:
                     for p in all_prods:
                         p_name = str(getattr(p, 'name', '')).casefold()
@@ -334,18 +338,17 @@ class Assistant:
                         if len(items) >= 4:
                             break
 
-            # Визначення базової відповіді (fallback)
             reply = fallback(message, items)
             handoff = not bool(items)
 
-            # 6. ВИКЛИК AI ГЕНЕРАЦІЇ (якщо є товари та ключ)
-            if items and getattr(self.settings, 'gemini_key', None):
+            # 6. AI-ГЕНЕРАЦІЯ ЕКСПЕРТНОЇ КОНСУЛЬТАЦІЇ
+            if getattr(self.settings, 'gemini_key', None):
                 try:
                     if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
                         result = await self.generate(message, history, items)
                         if result:
                             ai_reply, ids, ai_handoff = result
-                            matched_items = [p for p in items if str(getattr(p, 'id', '')) in ids]
+                            matched_items = [p for p in items if str(getattr(p, 'id', '')) in [str(x).strip() for x in ids]]
                             if matched_items:
                                 items = matched_items
                             reply = ai_reply
@@ -361,21 +364,10 @@ class Assistant:
 
         except Exception as top_err:
             log.error(f"Critical error in assistant.answer: {top_err}", exc_info=True)
-            # Якщо виникла будь-яка непередбачена помилка, все одно спробуємо знайти герметики напряму
-            fallback_items = []
-            try:
-                for p in self._get_all_products():
-                    if 'гермет' in str(getattr(p, 'name', '')).casefold():
-                        fallback_items.append(p)
-                    if len(fallback_items) >= 3:
-                        break
-            except Exception:
-                pass
-
             return {
-                'reply': 'Знайшов варіанти герметиків у нашому каталозі. Перегляньте картки нижче або напишіть, для яких температурних умов потрібен матеріал:',
-                'products': [safe_public_product(p) for p in fallback_items],
-                'handoff': False
+                'reply': 'Підбираю необхідні матеріали з каталогу ABV Хімія. Перегляньте варіанти нижче або уточніть задачу:',
+                'products': [],
+                'handoff': True
             }
 
     async def generate(self, message, history, items):
@@ -438,8 +430,8 @@ class Assistant:
 
                     result = json.loads(raw_text, strict=False)
                     text = str(result.get('text', '')).strip()
-                    ids = [str(x) for x in result.get('product_ids', [])]
-                    allowed = {str(getattr(p, 'id', '')) for p in items}
+                    ids = [str(x).strip() for x in result.get('product_ids', [])]
+                    allowed = {str(getattr(p, 'id', '')).strip() for p in items}
 
                     if not text:
                         return None
