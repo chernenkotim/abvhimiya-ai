@@ -349,7 +349,6 @@ class Assistant:
                         if result:
                             ai_reply, ids, ai_handoff = result
                             matched_items = [p for p in items if str(getattr(p, 'id', '')).strip() in ids]
-                            # Якщо AI підібрав конкретні товари зі списку — показуємо їх, інакше перші доступні
                             items = matched_items if matched_items else items[:4]
                             reply = ai_reply
                             handoff = ai_handoff
@@ -371,75 +370,69 @@ class Assistant:
             }
 
     async def generate(self, message, history, items):
-        # Відбираємо до 4 товарів збалансовано (щоб при порівнянні потрапляли обидва матеріали)
         facts = []
-        for p in items[:4]:
-            attrs = getattr(p, 'attributes', {})
-            attrs_dict = attrs if isinstance(attrs, dict) else {}
+        for p in items[:3]:
             facts.append({
                 'id': str(getattr(p, 'id', '')).strip(),
                 'name': str(getattr(p, 'name', '')),
-                'description': str(getattr(p, 'description', '') or '')[:400],
-                'attributes': {str(k)[:40]: str(v)[:120] for k, v in list(attrs_dict.items())[:6]}
+                'vendor_code': str(getattr(p, 'vendor_code', '') or '')
             })
 
         payload = {
             'facts': facts,
-            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:250]} for h in history[-3:]],
+            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:200]} for h in history[-2:]],
             'message': redact(str(message))
         }
 
-        # Актуальна робоча модель Google Gemini
-        model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
-        if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name) or '2.5' in model_name:
-            model_name = 'gemini-3.8-flash'
+        raw_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip()
+        model_name = raw_model if re.fullmatch(r'[A-Za-z0-9._-]+', raw_model) else 'gemini-2.5-flash'
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}],
             'generationConfig': {
-                'temperature': 0.1,
-                'maxOutputTokens': 500,
+                'temperature': 0.2,
+                'maxOutputTokens': 350,
                 'responseMimeType': 'application/json'
             }
         }
 
+        custom_timeout = httpx.Timeout(connect=5.0, read=25.0, write=5.0, pool=5.0)
+
         try:
-            # 22 секунди таймаут для стабільної роботи мережі
-            async with asyncio.timeout(22):
-                async with self.semaphore, httpx.AsyncClient(timeout=20.0, follow_redirects=False) as client:
-                    response = await client.post(
-                        f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
-                        headers={'x-goog-api-key': self.settings.gemini_key},
-                        json=body
-                    )
-                    if response.status_code != 200:
-                        log.warning(f"Gemini API returned status {response.status_code}: {response.text}")
-                        return None
+            async with self.semaphore, httpx.AsyncClient(timeout=custom_timeout, follow_redirects=False) as client:
+                response = await client.post(
+                    f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
+                    headers={'x-goog-api-key': self.settings.gemini_key},
+                    json=body
+                )
+                if response.status_code != 200:
+                    log.warning(f"Gemini API returned status {response.status_code}: {response.text}")
+                    return None
 
-                    data = response.json()
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        return None
+                data = response.json()
+                candidates = data.get('candidates', [])
+                if not candidates:
+                    return None
 
-                    parts = candidates[0].get('content', {}).get('parts', [])
-                    raw_text = ''.join(p.get('text', '') for p in parts).strip()
-                    if not raw_text:
-                        return None
+                parts = candidates[0].get('content', {}).get('parts', [])
+                raw_text = ''.join(p.get('text', '') for p in parts).strip()
+                if not raw_text:
+                    return None
 
-                    if raw_text.startswith('```'):
-                        raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
-                        raw_text = re.sub(r'\s*```$', '', raw_text)
+                if raw_text.startswith('```'):
+                    raw_text = re.sub(r'^```(?:json)?\s*', '', raw_text)
+                    raw_text = re.sub(r'\s*```$', '', raw_text)
 
-                    result = json.loads(raw_text, strict=False)
-                    text = str(result.get('text', '')).strip()
-                    ids = [str(x).strip() for x in result.get('product_ids', []) if x]
-                    allowed = {str(getattr(p, 'id', '')).strip() for p in items}
+                result = json.loads(raw_text, strict=False)
+                text = str(result.get('text', '')).strip()
+                ids = [str(x).strip() for x in result.get('product_ids', []) if x]
+                allowed = {str(getattr(p, 'id', '')).strip() for p in items}
 
-                    if not text:
-                        return None
+                if not text:
+                    return None
 
-                    return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
+                return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
         except Exception as e:
             err_name = type(e).__name__
             log.warning(f'AI model response unavailable ({err_name}: {repr(e)}), using catalog fallback')
