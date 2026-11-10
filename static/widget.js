@@ -1,4 +1,5 @@
 'use strict';
+
 (() => {
   const $ = id => document.getElementById(id);
   const embedded = new URLSearchParams(location.search).has('embedded');
@@ -12,7 +13,7 @@
   let selectedProduct = null;
   let requestId = null;
 
-  const storageKey = 'abv_consultant_session_v3';
+  const storageKey = 'abv_consultant_session_v4';
   const storage = {
     get: () => {
       try { return sessionStorage.getItem(storageKey); } catch { return null; }
@@ -39,12 +40,24 @@
 
   function message(text, role = 'assistant') {
     const n = node('div', text, `message ${role}`);
-    // Зберігаємо структуру абзаців та списків
     n.style.whiteSpace = 'pre-wrap';
     n.style.wordBreak = 'break-word';
     $('messages').append(n);
     scroll();
     return n;
+  }
+
+  // Створення елемента індикатора завантаження ("Бот друкує...")
+  function showTypingIndicator() {
+    const template = $('tpl-typing');
+    if (template) {
+      const clone = template.content.cloneNode(true);
+      const el = clone.firstElementChild;
+      $('messages').append(el);
+      scroll();
+      return el;
+    }
+    return message('Друкує відповідь…');
   }
 
   async function session() {
@@ -69,7 +82,6 @@
 
   async function post(url, data, retry = true) {
     const controller = new AbortController();
-    // Збільшено таймаут до 30 секунд для важких технічних відповідей AI
     const timer = setTimeout(() => controller.abort(), 30000);
     try {
       const activeSession = await session();
@@ -165,22 +177,28 @@
     $('question').value = '';
 
     message(cleanText, 'user');
-    const pending = message('Уточнюю за каталогом…');
+    const typingIndicator = showTypingIndicator();
 
     try {
       const data = await post('/api/chat', { message: cleanText });
-      pending.textContent = data.reply || 'Ось знайдені варіанти:';
+      typingIndicator.remove();
+      
+      message(data.reply || 'Ось знайдені варіанти:');
       (data.products || []).forEach(product);
       if (data.handoff) handoff();
     } catch (e) {
-      pending.textContent = e.message;
+      typingIndicator.remove();
+      message(e.message);
       $('question').value = cleanText;
     } finally {
       busy = false;
       $('send').disabled = false;
       $('clear').disabled = false;
       scroll();
-      $('question').focus();
+      // Фокус повертаємо лише на десктопі, щоб на мобільних не стрибала клавіатура
+      if (window.innerWidth > 768) {
+        $('question').focus();
+      }
     }
   }
 
@@ -192,7 +210,7 @@
       : 'Контакт потрібен лише для опрацювання вашого звернення.';
     $('lead-error').textContent = '';
     $('lead-dialog').showModal();
-    $('name').focus();
+    $('phone').focus();
   }
 
   $('composer').addEventListener('submit', e => {
@@ -256,7 +274,7 @@
     try {
       await post('/api/clear-history', {});
       $('messages').replaceChildren();
-      message('Діалог очищено. Що саме ви шукаєте?');
+      message('Діалог очищено. Чим можу допомогти з асортиментом ABV Хімія?');
     } catch (e) {
       message(e.message);
     } finally {
@@ -277,35 +295,45 @@
 
   async function init() {
     try {
-      const r = await fetch('/api/config');
-      if (!r.ok) throw new Error('Не вдалося завантажити налаштування');
-      config = await r.json();
+      // Паралельне завантаження конфігу та історії для миттєвого відображення
+      const [configRes, historyRes] = await Promise.all([
+        fetch('/api/config').then(r => r.ok ? r.json() : null),
+        post('/api/history', {}).catch(() => ({ messages: [] }))
+      ]);
 
-      $('notice').classList.toggle('demo', !!config.demo);
-      $('notice').textContent = config.demo
-        ? 'Режим перевірки · заявки лише локальні'
-        : config.catalog_ready
-          ? 'Працюємо за каталогом магазину · контакт залишайте у формі'
-          : 'Каталог оновлюється · можна залишити заявку менеджеру';
+      if (configRes) {
+        config = configRes;
+        $('notice').classList.toggle('demo', !!config.demo);
+        $('notice').textContent = config.demo
+          ? 'Режим перевірки · заявки лише локальні'
+          : config.catalog_ready
+            ? 'Працюємо за каталогом магазину · контакт залишайте у формі'
+            : 'Каталог оновлюється · можна залишити заявку менеджеру';
 
-      if (config.privacy_url) {
-        for (const id of ['privacy', 'consent-privacy']) {
-          const el = $(id);
-          if (el) el.href = config.privacy_url;
+        if (config.privacy_url) {
+          for (const id of ['privacy', 'consent-privacy']) {
+            const el = $(id);
+            if (el) el.href = config.privacy_url;
+          }
         }
       }
 
-      const data = await post('/api/history', {});
-      if (data.messages?.length) {
+      if (historyRes.messages?.length) {
         $('messages').replaceChildren();
-        for (const m of data.messages) {
+        for (const m of historyRes.messages) {
           message(m.text, m.role === 'user' ? 'user' : 'assistant');
           (m.products || []).forEach(product);
+          // Виправлено: тепер історія коректно відновлює кнопки хендоффу
           if (m.handoff) handoff();
         }
       }
     } catch (e) {
       if ($('notice')) $('notice').textContent = e.message;
+    } finally {
+      // Початковий фокус на полі вводу на десктопі
+      if (window.innerWidth > 768 && $('question')) {
+        $('question').focus();
+      }
     }
   }
 
