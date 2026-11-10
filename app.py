@@ -5,16 +5,16 @@ import hashlib
 import html
 import json
 import logging
-from pathlib import Path
 import secrets
 import time
 from uuid import UUID
 import weakref
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, Depends, HTTPException, Request
+from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
+from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, field_validator
@@ -79,6 +79,8 @@ class BodyLimit:
             return await receive()
         await self.app(scope, replay, send)
 
+security = HTTPBasic()
+
 def create_app(settings=None):
     settings = (settings or Settings.from_env()).validate()
     store, catalog = Storage(settings.db_path), Catalog(settings)
@@ -122,11 +124,14 @@ def create_app(settings=None):
             for task in tasks: 
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
+            # Закриваємо пули з'єднань асистента
+            if hasattr(assistant, 'aclose'):
+                await assistant.aclose()
             store.close()
 
     app = FastAPI(
         title='ABV Хімія — чат-консультант',
-        version='3.0.0',
+        version='3.0.1',
         lifespan=lifespan,
         docs_url=None if settings.production else '/docs',
         redoc_url=None
@@ -144,7 +149,7 @@ def create_app(settings=None):
     app.mount('/static', StaticFiles(directory=BASE / 'static'), name='static')
 
     @app.middleware('http')
-    async def security(request: Request, call_next):
+    async def headers_middleware(request: Request, call_next):
         origin = request.headers.get('origin', '')
         if request.method in ('POST', 'PATCH', 'PUT', 'DELETE') and origin and origin not in origins:
             return JSONResponse({'detail': 'Заборонене джерело запиту'}, status_code=403)
@@ -195,9 +200,19 @@ def create_app(settings=None):
         except (ValueError, TypeError): 
             raise HTTPException(403, 'Сесія недійсна або завершилася', headers={'X-Session-Expired': '1'})
 
-    # Вхід до кабінету без пароля (залишається лише лімітер запитів)
-    async def admin_auth(request: Request):
+    # Базова авторизація для адмінки
+    async def admin_auth(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
         limit(request, 'admin')
+        
+        correct_username = secrets.compare_digest(credentials.username, getattr(settings, 'admin_user', 'admin'))
+        correct_password = secrets.compare_digest(credentials.password, getattr(settings, 'admin_password', 'abvhimiya2026'))
+        
+        if not (correct_username and correct_password):
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Невірний логін або пароль",
+                headers={"WWW-Authenticate": "Basic"},
+            )
         return True
 
     @app.get('/')
@@ -206,7 +221,7 @@ def create_app(settings=None):
         return FileResponse(BASE / 'static' / 'widget.html')
 
     @app.get('/admin')
-    async def admin_view(): 
+    async def admin_view(auth_passed: bool = Depends(admin_auth)): 
         return FileResponse(BASE / 'static' / 'admin.html')
 
     @app.get('/privacy')
@@ -263,21 +278,31 @@ def create_app(settings=None):
             raise HTTPException(422, 'Напишіть питання')
         
         lock = turn_locks.setdefault(uid, asyncio.Lock())
+        # Спочатку блокуємо і читаємо історію
         async with lock:
             history = store.history(uid)
-            clean_msg = redact(message)
-            
-            # Виклик асистента з поточною історією
-            answer = await assistant.answer(clean_msg, history)
-            
-            # Збереження оновленої історії без дублювання
-            store.save_history(uid, history + [
+        
+        clean_msg = redact(message)
+        
+        # ВИКЛИКАЄМО ШІ ПОЗА ЛОКОМ (щоб не блокувати наступні запити, поки чекаємо Gemini)
+        try:
+            # Захист від таймауту на рівні FastAPI (28 сек, бо на клієнті 30 сек)
+            async with asyncio.timeout(28.0):
+                answer = await assistant.answer(clean_msg, history)
+        except asyncio.TimeoutError:
+            log.warning(f"FastAPI chat endpoint timeout for user {uid}")
+            answer = {'reply': 'Запит надто складний, і я не встиг його обробити. Уточніть питання або зверніться до менеджера.', 'products': [], 'handoff': True}
+        
+        # Зберігаємо результат, знову беремо лок
+        async with lock:
+            current_history = store.history(uid)
+            store.save_history(uid, current_history + [
                 {'role': 'user', 'text': clean_msg},
                 {
                     'role': 'assistant',
                     'text': redact(answer['reply']),
-                    'product_ids': [p['id'] for p in answer['products']],
-                    'handoff': answer['handoff']
+                    'product_ids': [p['id'] for p in answer.get('products', [])],
+                    'handoff': answer.get('handoff', False)
                 }
             ])
         return answer
@@ -348,7 +373,6 @@ def create_app(settings=None):
 
     @app.get('/admin/dialogs-data', dependencies=[Depends(admin_auth)])
     async def get_dialogs_data(limit: int = 50, offset: int = 0):
-        """API-ендпоінт для отримання списку останніх розмов клієнтів."""
         return store.list_dialogs(limit=min(limit, 100), offset=offset)
 
     @app.patch('/admin/leads/{request_id}', dependencies=[Depends(admin_auth)])
