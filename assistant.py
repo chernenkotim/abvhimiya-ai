@@ -386,14 +386,16 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # 2. Пул перевірених і стабільних моделей v1beta
-        configured_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.0-flash').strip()
+        # 2. Пул тільки нових та дозволених моделей (gemini-3.8-flash)
+        configured_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
         
-        # Гарантований ланцюжок моделей від найшвидшої до надійних
         models_to_try = []
-        for candidate in [configured_model, 'gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']:
-            if candidate and candidate not in models_to_try:
-                models_to_try.append(candidate)
+        # Завжди додаємо актуальну модель, яку вимагав Google
+        for candidate in [configured_model, 'gemini-3.8-flash', 'gemini-3.8-flash-lite']:
+            # Очищаємо префікс "models/", якщо він випадково потрапив із налаштувань
+            clean_candidate = candidate.replace('models/', '')
+            if clean_candidate and clean_candidate not in models_to_try:
+                models_to_try.append(clean_candidate)
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
@@ -417,7 +419,7 @@ class Assistant:
                         json=body
                     )
 
-                    # Якщо модель не підтримується цим ключем або черга
+                    # Якщо перевантаження або модель вимкнуто — переходимо до наступної
                     if response.status_code in (404, 503, 429):
                         log.warning(f"Model {model_name} status {response.status_code}, switching to next model in pool...")
                         continue
