@@ -1,6 +1,247 @@
-<!doctype html><html lang="uk"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Заявки — ABV Хімія</title><link rel="stylesheet" href="/static/admin.css"><script src="/static/admin.js" defer></script></head>
-<body><main><header><div><p class="brand">ABV ХІМІЯ / КАБІНЕТ МЕНЕДЖЕРА</p><h1>Заявки з чату</h1></div><button id="logout">Вийти</button></header>
-<form id="login"><label for="token">Ключ адміністратора</label><div class="row"><input id="token" type="password" autocomplete="off" required placeholder="ADMIN_TOKEN"><button type="submit">Увійти</button></div><small>Ключ зберігається лише в пам’яті вкладки. Сесію буде очищено через 15 хвилин без дій.</small></form>
-<p id="error" role="alert"></p><p id="overview" role="status"></p>
-<section id="workspace" hidden><div class="row filters"><label for="filter">Стан</label><select id="filter"><option value="">Усі</option><option value="new">Нові</option><option value="in_progress">У роботі</option><option value="done">Опрацьовані</option></select><button id="refresh">Оновити</button><button id="catalog-refresh">Оновити каталог</button></div><div id="leads"></div><div class="row"><button id="prev">← Назад</button><span id="page"></span><button id="next">Далі →</button></div></section>
-</main></body></html>
+<!doctype html>
+<html lang="uk">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Панель керування — ABV Хімія</title>
+    <link rel="stylesheet" href="/static/admin.css">
+    <style>
+        /* Стилі для вкладок та стрічки діалогів */
+        .tab-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
+        .tab-btn { background: #fff; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; font-weight: 500; }
+        .tab-btn.active { background: #0070f3; color: #fff; border-color: #0070f3; }
+        .dialog-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+        .dialog-card summary { padding: 12px 16px; cursor: pointer; font-weight: 600; background: #fafafa; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; outline: none; }
+        .chat-body { padding: 14px; display: flex; flex-direction: column; gap: 10px; background: #fdfdfd; }
+        .chat-msg { max-width: 82%; padding: 10px 14px; border-radius: 8px; font-size: 13.5px; line-height: 1.45; }
+        .msg-client { background: #0070f3; color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
+        .msg-bot { background: #f3f4f6; color: #111827; align-self: flex-start; border: 1px solid #e5e7eb; border-bottom-left-radius: 2px; }
+        .msg-header { font-size: 11px; opacity: 0.75; margin-bottom: 4px; }
+        .meta-tag { font-size: 12px; color: #6b7280; font-weight: normal; }
+    </style>
+</head>
+<body>
+<main>
+    <header>
+        <div>
+            <p class="brand">ABV ХІМІЯ / КАБІНЕТ МЕНЕДЖЕРА</p>
+            <h1 id="page-title">Заявки з чату</h1>
+        </div>
+        <button id="logout" style="display:none;" onclick="logout()">Вийти</button>
+    </header>
+
+    <form id="login" onsubmit="event.preventDefault(); login();">
+        <label for="token">Ключ адміністратора</label>
+        <div class="row">
+            <input id="token" type="password" autocomplete="off" required placeholder="ADMIN_TOKEN">
+            <button type="submit">Увійти</button>
+        </div>
+        <small>Ключ зберігається у сесії вкладки. Сесію буде очищено після виходу.</small>
+    </form>
+
+    <p id="error" role="alert" style="color: #ef4444; margin: 10px 0;"></p>
+    <p id="overview" role="status" style="margin: 10px 0;"></p>
+
+    <section id="workspace" hidden>
+        <!-- Навігація вкладками -->
+        <div class="tab-bar">
+            <button id="btnTabLeads" class="tab-btn active" onclick="switchTab('leads')">Заявки з форми (<span id="leads-count">0</span>)</button>
+            <button id="btnTabDialogs" class="tab-btn" onclick="switchTab('dialogs')">Живі діалоги чату (<span id="dialogs-count">0</span>)</button>
+        </div>
+
+        <!-- Керування заявками -->
+        <div id="leads-controls" class="row filters">
+            <label for="filter">Стан</label>
+            <select id="filter" onchange="loadLeads()">
+                <option value="">Усі</option>
+                <option value="new">Нові</option>
+                <option value="in_progress">У роботі</option>
+                <option value="done">Опрацьовані</option>
+            </select>
+            <button onclick="refreshData()">Оновити</button>
+            <button onclick="refreshCatalog()">Оновити каталог</button>
+        </div>
+
+        <!-- Керування діалогами -->
+        <div id="dialogs-controls" class="row filters" style="display:none;">
+            <button onclick="loadDialogs()">Оновити список діалогів</button>
+            <span style="font-size:13px; color:#6b7280;">Показуються останні розмови з чату</span>
+        </div>
+
+        <!-- Контейнери списків -->
+        <div id="leads"></div>
+        <div id="dialogs" style="display:none;"></div>
+
+        <!-- Пагінація для заявок -->
+        <div id="pagination" class="row">
+            <button id="prev" onclick="changePage(-1)">← Назад</button>
+            <span id="page"></span>
+            <button id="next" onclick="changePage(1)">Далі →</button>
+        </div>
+    </section>
+</main>
+
+<script>
+    let token = sessionStorage.getItem('admin_token') || '';
+    let currentTab = 'leads';
+    let leadOffset = 0;
+    const leadLimit = 20;
+
+    function init() {
+        if (!token) {
+            document.getElementById('login').hidden = false;
+            document.getElementById('workspace').hidden = true;
+            document.getElementById('logout').style.display = 'none';
+        } else {
+            document.getElementById('login').hidden = true;
+            document.getElementById('workspace').hidden = false;
+            document.getElementById('logout').style.display = 'block';
+            loadOverview();
+            refreshData();
+        }
+    }
+
+    function login() {
+        const val = document.getElementById('token').value.trim();
+        if (val) {
+            token = val;
+            sessionStorage.setItem('admin_token', token);
+            document.getElementById('error').innerText = '';
+            init();
+        }
+    }
+
+    function logout() {
+        token = '';
+        sessionStorage.removeItem('admin_token');
+        location.reload();
+    }
+
+    function switchTab(tab) {
+        currentTab = tab;
+        const isLeads = tab === 'leads';
+        document.getElementById('btnTabLeads').classList.toggle('active', isLeads);
+        document.getElementById('btnTabDialogs').classList.toggle('active', !isLeads);
+        document.getElementById('leads-controls').style.display = isLeads ? 'flex' : 'none';
+        document.getElementById('dialogs-controls').style.display = isLeads ? 'none' : 'flex';
+        document.getElementById('leads').style.display = isLeads ? 'block' : 'none';
+        document.getElementById('dialogs').style.display = isLeads ? 'none' : 'block';
+        document.getElementById('pagination').style.display = isLeads ? 'flex' : 'none';
+        document.getElementById('page-title').innerText = isLeads ? 'Заявки з чату' : 'Живі діалоги з покупцями';
+
+        if (isLeads) loadLeads();
+        else loadDialogs();
+    }
+
+    async function api(path, opts = {}) {
+        opts.headers = opts.headers || {};
+        opts.headers['Authorization'] = 'Bearer ' + token;
+        const res = await fetch(path, opts);
+        if (res.status === 401) {
+            document.getElementById('error').innerText = 'Невірний токен авторизації';
+            logout();
+            throw new Error('401');
+        }
+        return res.json();
+    }
+
+    async function loadOverview() {
+        try {
+            const data = await api('/admin/overview');
+            document.getElementById('overview').innerText = `Каталог: ${data.catalog.count} товарів (актуальний). Сповіщення: ${data.telegram_configured ? 'налаштовано' : 'вимкнено'}.`;
+        } catch (e) {}
+    }
+
+    async function loadLeads() {
+        const state = document.getElementById('filter').value;
+        const path = `/admin/leads?limit=${leadLimit}&offset=${leadOffset}${state ? '&state=' + state : ''}`;
+        try {
+            const data = await api(path);
+            document.getElementById('leads-count').innerText = data.total;
+            const container = document.getElementById('leads');
+            if (!data.leads || data.leads.length === 0) {
+                container.innerHTML = '<p>Заявок за цим фільтром немає.</p>';
+                return;
+            }
+            container.innerHTML = data.leads.map(l => {
+                const p = l.details || {};
+                const date = new Date(l.created * 1000).toLocaleString('uk-UA');
+                return `
+                    <div class="card" style="margin-bottom:12px; padding:12px; border:1px solid #e5e7eb; border-radius:6px; background:#fff;">
+                        <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
+                            <strong>${p.name || 'Клієнт'} (${p.phone})</strong>
+                            <span style="font-size:12px; color:#6b7280;">${date} • Стан: <b>${l.state}</b></span>
+                        </div>
+                        ${p.product ? `<div>Товар: <b>${p.product.name}</b> (Арт: ${p.product.vendor_code || p.product.id})</div>` : ''}
+                        ${p.note ? `<div>Коментар: ${p.note}</div>` : ''}
+                    </div>
+                `;
+            }).join('');
+            document.getElementById('page').innerText = `Всього: ${data.total}`;
+        } catch (e) {}
+    }
+
+    async function loadDialogs() {
+        try {
+            const data = await api('/admin/dialogs-data?limit=40');
+            document.getElementById('dialogs-count').innerText = data.total || 0;
+            const container = document.getElementById('dialogs');
+            if (!data.dialogs || data.dialogs.length === 0) {
+                container.innerHTML = '<p>Поки що немає збережених діалогів.</p>';
+                return;
+            }
+            container.innerHTML = data.dialogs.map(d => {
+                const dateStr = new Date(d.updated * 1000).toLocaleString('uk-UA');
+                const msgs = d.messages || [];
+                const firstUserMsg = msgs.find(m => m.role === 'user')?.text || 'Діалог без слів';
+
+                const chatHtml = msgs.map(m => {
+                    const isUser = m.role === 'user';
+                    return `
+                        <div class="chat-msg ${isUser ? 'msg-client' : 'msg-bot'}">
+                            <div class="msg-header">${isUser ? 'Клієнт' : 'Асистент ABV'}</div>
+                            <div>${m.text}</div>
+                        </div>
+                    `;
+                }).join('');
+
+                return `
+                    <details class="dialog-card">
+                        <summary>
+                            <span>💬 "${firstUserMsg.substring(0, 60)}..."</span>
+                            <span class="meta-tag">${dateStr} • ${msgs.length} повід.</span>
+                        </summary>
+                        <div class="chat-body">
+                            ${chatHtml}
+                        </div>
+                    </details>
+                `;
+            }).join('');
+        } catch (e) {}
+    }
+
+    function refreshData() {
+        loadOverview();
+        if (currentTab === 'leads') loadLeads();
+        else loadDialogs();
+    }
+
+    async function refreshCatalog() {
+        try {
+            const res = await api('/admin/refresh-catalog', { method: 'POST' });
+            alert(`Каталог оновлено! Завантажено товарів: ${res.count}`);
+            loadOverview();
+        } catch (e) {
+            alert('Помилка оновлення каталогу');
+        }
+    }
+
+    function changePage(delta) {
+        leadOffset = Math.max(0, leadOffset + (delta * leadLimit));
+        loadLeads();
+    }
+
+    init();
+</script>
+</body>
+</html>
