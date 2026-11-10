@@ -4,19 +4,55 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Панель керування — ABV Хімія</title>
-    <link rel="stylesheet" href="/static/admin.css">
+    <!-- Використовуємо вбудовані стилі для автономності -->
     <style>
-        .tab-bar { display: flex; gap: 8px; margin: 16px 0; border-bottom: 1px solid #e5e7eb; padding-bottom: 8px; }
-        .tab-btn { background: #fff; border: 1px solid #d1d5db; border-radius: 6px; padding: 8px 16px; cursor: pointer; font-size: 14px; font-weight: 500; }
-        .tab-btn.active { background: #0070f3; color: #fff; border-color: #0070f3; }
-        .dialog-card { background: #fff; border: 1px solid #e5e7eb; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
-        .dialog-card summary { padding: 12px 16px; cursor: pointer; font-weight: 600; background: #fafafa; border-bottom: 1px solid #f0f0f0; display: flex; justify-content: space-between; outline: none; }
-        .chat-body { padding: 14px; display: flex; flex-direction: column; gap: 10px; background: #fdfdfd; }
-        .chat-msg { max-width: 82%; padding: 10px 14px; border-radius: 8px; font-size: 13.5px; line-height: 1.45; white-space: pre-wrap; word-break: break-word; }
-        .msg-client { background: #0070f3; color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
-        .msg-bot { background: #f3f4f6; color: #111827; align-self: flex-start; border: 1px solid #e5e7eb; border-bottom-left-radius: 2px; }
-        .msg-header { font-size: 11px; opacity: 0.75; margin-bottom: 4px; font-weight: 600; }
-        .meta-tag { font-size: 12px; color: #6b7280; font-weight: normal; }
+        :root {
+            --primary: #0868a6;
+            --primary-hover: #0a79c2;
+            --bg: #f4f7f9;
+            --surface: #ffffff;
+            --border: #e2e8f0;
+            --text-main: #1e293b;
+            --text-muted: #64748b;
+        }
+        * { box-sizing: border-box; }
+        body { font-family: system-ui, -apple-system, sans-serif; background: var(--bg); color: var(--text-main); margin: 0; padding: 24px; line-height: 1.5; }
+        main { max-width: 1000px; margin: 0 auto; }
+        header { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 24px; border-bottom: 1px solid var(--border); padding-bottom: 16px; }
+        .brand { font-size: 12px; font-weight: 600; color: var(--text-muted); letter-spacing: 1px; margin: 0 0 4px 0; }
+        h1 { font-size: 24px; margin: 0; }
+        
+        button { cursor: pointer; background: var(--surface); border: 1px solid var(--border); padding: 8px 14px; border-radius: 6px; font-size: 13px; font-weight: 500; transition: 0.2s; color: var(--text-main); }
+        button:hover:not(:disabled) { border-color: var(--primary); color: var(--primary); }
+        button.btn-primary { background: var(--primary); color: white; border-color: var(--primary); }
+        button.btn-primary:hover { background: var(--primary-hover); }
+        button:disabled { opacity: 0.5; cursor: not-allowed; }
+        select { padding: 8px; border: 1px solid var(--border); border-radius: 6px; font-size: 13px; background: var(--surface); }
+
+        .tab-bar { display: flex; gap: 8px; margin-bottom: 20px; }
+        .tab-btn { background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 10px 20px; cursor: pointer; font-size: 14px; font-weight: 500; color: var(--text-muted); transition: 0.2s; }
+        .tab-btn.active { background: var(--primary); color: #fff; border-color: var(--primary); }
+        
+        .filters { display: flex; gap: 12px; align-items: center; margin-bottom: 20px; flex-wrap: wrap; }
+        
+        .card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.05); }
+        .card-header { display: flex; justify-content: space-between; align-items: flex-start; margin-bottom: 8px; }
+        .badge { font-size: 11px; padding: 4px 8px; border-radius: 12px; font-weight: 600; text-transform: uppercase; }
+        .badge.new { background: #fee2e2; color: #991b1b; }
+        .badge.in_progress { background: #fef3c7; color: #92400e; }
+        .badge.done { background: #d1fae5; color: #065f46; }
+        
+        .dialog-card { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+        .dialog-card summary { padding: 16px; cursor: pointer; font-weight: 600; background: var(--surface); display: flex; justify-content: space-between; outline: none; user-select: none; transition: background 0.2s; }
+        .dialog-card summary:hover { background: #f8fafc; }
+        .chat-body { padding: 16px; display: flex; flex-direction: column; gap: 12px; background: #f8fafc; border-top: 1px solid var(--border); }
+        .chat-msg { max-width: 85%; padding: 10px 14px; border-radius: 12px; font-size: 13.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; }
+        .msg-client { background: var(--primary); color: #fff; align-self: flex-end; border-bottom-right-radius: 2px; }
+        .msg-bot { background: #fff; color: var(--text-main); align-self: flex-start; border: 1px solid var(--border); border-bottom-left-radius: 2px; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
+        .msg-header { font-size: 11px; opacity: 0.8; margin-bottom: 4px; font-weight: 600; }
+        .meta-tag { font-size: 12px; color: var(--text-muted); font-weight: normal; }
+        
+        .status-actions { display: flex; gap: 8px; margin-top: 12px; padding-top: 12px; border-top: 1px dashed var(--border); }
     </style>
 </head>
 <body>
@@ -26,10 +62,10 @@
             <p class="brand">ABV ХІМІЯ / КАБІНЕТ МЕНЕДЖЕРА</p>
             <h1 id="page-title">Заявки з чату</h1>
         </div>
+        <div id="overview" style="font-size: 13px; color: var(--text-muted); text-align: right;"></div>
     </header>
 
-    <p id="error" role="alert" style="color: #ef4444; margin: 10px 0;"></p>
-    <p id="overview" role="status" style="margin: 10px 0;"></p>
+    <p id="error" role="alert" style="color: #ef4444; font-weight: 500;"></p>
 
     <section id="workspace">
         <div class="tab-bar">
@@ -37,29 +73,30 @@
             <button id="btnTabDialogs" class="tab-btn" onclick="switchTab('dialogs')">Живі діалоги чату (<span id="dialogs-count">0</span>)</button>
         </div>
 
-        <div id="leads-controls" class="row filters">
-            <label for="filter">Стан</label>
-            <select id="filter" onchange="loadLeads()">
-                <option value="">Усі</option>
-                <option value="new">Нові</option>
-                <option value="in_progress">У роботі</option>
-                <option value="done">Опрацьовані</option>
+        <div id="leads-controls" class="filters">
+            <label for="filter" style="font-size:14px; font-weight:500;">Фільтр:</label>
+            <select id="filter" onchange="resetPage(); loadLeads();">
+                <option value="">Усі заявки</option>
+                <option value="new" selected>🔥 Нові</option>
+                <option value="in_progress">⏳ У роботі</option>
+                <option value="done">✅ Опрацьовані</option>
             </select>
-            <button onclick="refreshData()">Оновити</button>
+            <button class="btn-primary" onclick="refreshData()">🔄 Оновити дані</button>
             <button onclick="refreshCatalog()">Оновити каталог</button>
+            <span id="auto-refresh-indicator" style="font-size:12px; color:var(--text-muted); margin-left:auto;">🟢 Автооновлення увімкнено</span>
         </div>
 
-        <div id="dialogs-controls" class="row filters" style="display:none;">
-            <button onclick="loadDialogs()">Оновити список діалогів</button>
-            <span style="font-size:13px; color:#6b7280;">Показуються останні розмови клієнтів з асистентом</span>
+        <div id="dialogs-controls" class="filters" style="display:none;">
+            <button class="btn-primary" onclick="loadDialogs()">🔄 Оновити діалоги</button>
+            <span style="font-size:13px; color:var(--text-muted);">Показуються останні розмови клієнтів з AI-асистентом</span>
         </div>
 
         <div id="leads"></div>
         <div id="dialogs" style="display:none;"></div>
 
-        <div id="pagination" class="row">
-            <button id="prev" onclick="changePage(-1)">← Назад</button>
-            <span id="page"></span>
+        <div id="pagination" class="filters" style="justify-content: center; margin-top: 20px;">
+            <button id="prev" onclick="changePage(-1)" disabled>← Назад</button>
+            <span id="page" style="font-size:13px; font-weight:500;">Сторінка 1</span>
             <button id="next" onclick="changePage(1)">Далі →</button>
         </div>
     </section>
@@ -67,8 +104,16 @@
 
 <script>
     let currentTab = 'leads';
-    let leadOffset = 0;
-    const leadLimit = 20;
+    let currentOffset = 0;
+    const limit = 20;
+    let totalItems = 0;
+    let refreshInterval;
+
+    const STATE_LABELS = {
+        'new': 'Нова',
+        'in_progress': 'В роботі',
+        'done': 'Опрацьована'
+    };
 
     function escapeHtml(str) {
         if (!str) return '';
@@ -83,18 +128,26 @@
     function init() {
         loadOverview();
         refreshData();
+        // Автооновлення кожні 15 секунд
+        refreshInterval = setInterval(() => {
+            if(currentOffset === 0) refreshData(true); 
+        }, 15000);
     }
 
     function switchTab(tab) {
         currentTab = tab;
+        resetPage();
+        
         const isLeads = tab === 'leads';
         document.getElementById('btnTabLeads').classList.toggle('active', isLeads);
         document.getElementById('btnTabDialogs').classList.toggle('active', !isLeads);
+        
         document.getElementById('leads-controls').style.display = isLeads ? 'flex' : 'none';
         document.getElementById('dialogs-controls').style.display = isLeads ? 'none' : 'flex';
+        
         document.getElementById('leads').style.display = isLeads ? 'block' : 'none';
         document.getElementById('dialogs').style.display = isLeads ? 'none' : 'block';
-        document.getElementById('pagination').style.display = isLeads ? 'flex' : 'none';
+        
         document.getElementById('page-title').innerText = isLeads ? 'Заявки з чату' : 'Живі діалоги з покупцями';
 
         if (isLeads) loadLeads();
@@ -102,14 +155,27 @@
     }
 
     async function api(path, opts = {}) {
+        // Обов'язково передаємо credentials для Basic Auth
+        opts.credentials = 'same-origin'; 
+        if (!opts.headers) opts.headers = {};
+        if (opts.method && opts.method !== 'GET') {
+            opts.headers['Content-Type'] = 'application/json';
+        }
+
         try {
             const res = await fetch(path, opts);
             if (!res.ok) {
-                throw new Error(`Помилка запиту: ${res.status}`);
+                if (res.status === 401) {
+                    window.location.reload(); // Спонукає браузер показати вікно логіну
+                    return;
+                }
+                const errData = await res.json().catch(() => ({}));
+                throw new Error(errData.detail || `Помилка сервера: ${res.status}`);
             }
             return await res.json();
         } catch (err) {
             document.getElementById('error').innerText = err.message;
+            setTimeout(() => document.getElementById('error').innerText = '', 5000);
             throw err;
         }
     }
@@ -117,52 +183,90 @@
     async function loadOverview() {
         try {
             const data = await api('/admin/overview');
-            document.getElementById('overview').innerText = `Каталог: ${data.catalog.count} товарів (актуальний). Сповіщення: ${data.telegram_configured ? 'налаштовано' : 'вимкнено'}.`;
-            document.getElementById('error').innerText = '';
+            document.getElementById('overview').innerHTML = `
+                Каталог: <b>${data.catalog.count}</b> товарів<br>
+                Telegram: ${data.telegram_configured ? '🟢 Увімкнено' : '🔴 Вимкнено'}
+            `;
         } catch (e) {}
     }
 
-    async function loadLeads() {
+    async function changeLeadState(id, newState) {
+        if (!confirm(`Змінити статус заявки на "${STATE_LABELS[newState]}"?`)) return;
+        try {
+            await api(`/admin/leads/${id}`, {
+                method: 'PATCH',
+                body: JSON.stringify({ state: newState })
+            });
+            loadLeads(); // Оновлюємо список
+        } catch (e) {
+            alert('Помилка при зміні статусу');
+        }
+    }
+
+    async function loadLeads(silent = false) {
         const state = document.getElementById('filter').value;
-        const path = `/admin/leads?limit=${leadLimit}&offset=${leadOffset}${state ? '&state=' + state : ''}`;
+        const path = `/admin/leads?limit=${limit}&offset=${currentOffset}${state ? '&state=' + state : ''}`;
+        
         try {
             const data = await api(path);
+            totalItems = data.total;
             document.getElementById('leads-count').innerText = data.total;
+            updatePagination();
+
             const container = document.getElementById('leads');
             if (!data.leads || data.leads.length === 0) {
-                container.innerHTML = '<p style="color:#6b7280; padding:12px 0;">Заявок за цим фільтром немає.</p>';
+                container.innerHTML = '<div class="card" style="text-align:center; color:var(--text-muted);">Заявок немає.</div>';
                 return;
             }
+            
             container.innerHTML = data.leads.map(l => {
                 const p = l.details || {};
                 const date = new Date(l.created * 1000).toLocaleString('uk-UA');
+                const badgeClass = l.state === 'new' ? 'new' : (l.state === 'in_progress' ? 'in_progress' : 'done');
+                
                 return `
-                    <div class="card" style="margin-bottom:12px; padding:14px; border:1px solid #e5e7eb; border-radius:6px; background:#fff;">
-                        <div style="display:flex; justify-content:space-between; margin-bottom:6px;">
-                            <strong>${escapeHtml(p.name || 'Клієнт')} (${escapeHtml(p.phone)})</strong>
-                            <span style="font-size:12px; color:#6b7280;">${date} • Стан: <b>${escapeHtml(l.state)}</b></span>
+                    <div class="card">
+                        <div class="card-header">
+                            <div>
+                                <div style="font-size:16px; font-weight:600; margin-bottom:4px;">${escapeHtml(p.name || 'Клієнт без імені')}</div>
+                                <div style="font-size:18px; color:var(--primary); font-weight:700;">${escapeHtml(p.phone)}</div>
+                            </div>
+                            <div style="text-align:right;">
+                                <span class="badge ${badgeClass}">${STATE_LABELS[l.state] || l.state}</span>
+                                <div style="font-size:12px; color:var(--text-muted); margin-top:4px;">${date}</div>
+                            </div>
                         </div>
-                        ${p.product ? `<div>Товар: <b>${escapeHtml(p.product.name)}</b> (Арт: ${escapeHtml(p.product.vendor_code || p.product.id)})</div>` : ''}
-                        ${p.note ? `<div style="margin-top:4px;">Коментар: ${escapeHtml(p.note)}</div>` : ''}
+                        ${p.product ? `<div style="padding:8px; background:var(--bg); border-radius:6px; margin:8px 0;">🛒 Цікавить: <b>${escapeHtml(p.product.name)}</b> <span style="color:var(--text-muted); font-size:12px;">(Арт: ${escapeHtml(p.product.vendor_code || p.product.id)})</span></div>` : ''}
+                        ${p.note ? `<div style="margin-top:8px;">📝 Коментар: <i>${escapeHtml(p.note)}</i></div>` : ''}
+                        
+                        <div class="status-actions">
+                            ${l.state !== 'new' ? `<button onclick="changeLeadState('${l.id}', 'new')">Повернути в Нові</button>` : ''}
+                            ${l.state !== 'in_progress' ? `<button onclick="changeLeadState('${l.id}', 'in_progress')">В роботу</button>` : ''}
+                            ${l.state !== 'done' ? `<button class="btn-primary" onclick="changeLeadState('${l.id}', 'done')">✔ Опрацьовано</button>` : ''}
+                        </div>
                     </div>
                 `;
             }).join('');
-            document.getElementById('page').innerText = `Всього: ${data.total}`;
         } catch (e) {}
     }
 
-    async function loadDialogs() {
+    async function loadDialogs(silent = false) {
         try {
-            const data = await api('/admin/dialogs-data?limit=40');
-            document.getElementById('dialogs-count').innerText = data.total || 0;
+            const data = await api(`/admin/dialogs-data?limit=${limit}&offset=${currentOffset}`);
+            totalItems = data.total || 0;
+            document.getElementById('dialogs-count').innerText = totalItems;
+            updatePagination();
+
             const container = document.getElementById('dialogs');
             if (!data.dialogs || data.dialogs.length === 0) {
-                container.innerHTML = '<p style="color:#6b7280; padding:12px 0;">Поки що немає збережених діалогів.</p>';
+                container.innerHTML = '<div class="card" style="text-align:center; color:var(--text-muted);">Діалогів немає.</div>';
                 return;
             }
+            
             container.innerHTML = data.dialogs.map(d => {
                 const dateStr = new Date(d.updated * 1000).toLocaleString('uk-UA');
                 const msgs = d.messages || [];
+                // Шукаємо перше повідомлення користувача, щоб вивести як заголовок
                 const firstUserMsg = msgs.find(m => m.role === 'user')?.text || 'Порожній діалог';
 
                 const chatHtml = msgs.map(m => {
@@ -178,7 +282,7 @@
                 return `
                     <details class="dialog-card">
                         <summary>
-                            <span>💬 "${escapeHtml(firstUserMsg.substring(0, 60))}..."</span>
+                            <span style="white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 70%;">💬 "${escapeHtml(firstUserMsg)}"</span>
                             <span class="meta-tag">${dateStr} • ${msgs.length} повід.</span>
                         </summary>
                         <div class="chat-body">
@@ -190,25 +294,50 @@
         } catch (e) {}
     }
 
-    function refreshData() {
+    function refreshData(silent = false) {
         loadOverview();
-        if (currentTab === 'leads') loadLeads();
-        else loadDialogs();
+        if (currentTab === 'leads') loadLeads(silent);
+        else loadDialogs(silent);
     }
 
     async function refreshCatalog() {
+        const btn = event.target;
+        btn.disabled = true;
+        btn.innerText = 'Оновлення...';
         try {
             const res = await api('/admin/refresh-catalog', { method: 'POST' });
-            alert(`Каталог оновлено! Завантажено товарів: ${res.count}`);
+            alert(`✅ Каталог успішно оновлено! Завантажено товарів: ${res.count}`);
             loadOverview();
         } catch (e) {
-            alert('Помилка оновлення каталогу');
+            alert('❌ Помилка оновлення каталогу. Можливо, файл не знайдено або сервер перевантажено.');
+        } finally {
+            btn.disabled = false;
+            btn.innerText = 'Оновити каталог';
         }
     }
 
+    function resetPage() {
+        currentOffset = 0;
+    }
+
+    function updatePagination() {
+        const pageNum = Math.floor(currentOffset / limit) + 1;
+        const totalPages = Math.ceil(totalItems / limit) || 1;
+        
+        document.getElementById('page').innerText = `Сторінка ${pageNum} з ${totalPages}`;
+        document.getElementById('prev').disabled = currentOffset === 0;
+        document.getElementById('next').disabled = currentOffset + limit >= totalItems;
+    }
+
     function changePage(delta) {
-        leadOffset = Math.max(0, leadOffset + (delta * leadLimit));
-        loadLeads();
+        const newOffset = currentOffset + (delta * limit);
+        if (newOffset < 0 || newOffset >= totalItems) return;
+        
+        currentOffset = newOffset;
+        if (currentTab === 'leads') loadLeads();
+        else loadDialogs();
+        
+        window.scrollTo({ top: 0, behavior: 'smooth' });
     }
 
     init();
