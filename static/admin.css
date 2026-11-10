@@ -1,1 +1,231 @@
-:root{font-family:system-ui,sans-serif;color:#19334a;background:#eff4f8}*{box-sizing:border-box}body{margin:0;padding:32px 18px}main{max-width:980px;margin:auto}header,.row{display:flex;align-items:center;gap:12px;flex-wrap:wrap}header{justify-content:space-between;margin-bottom:28px}.brand{font-size:11px;letter-spacing:1.2px;color:#42728f}h1{font-size:28px;margin:8px 0}h2{font-size:17px}button{cursor:pointer;border:1px solid #b9d0df;border-radius:8px;background:white;color:#0868a6;padding:10px 15px}button:disabled{opacity:.5;cursor:default}input,select{font:inherit;padding:10px;border:1px solid #c5d8e4;border-radius:8px}input{width:min(100%,480px)}label{font-size:13px}small{display:block;color:#687e8e;margin-top:10px}#login,.entry{background:white;border:1px solid #d5e3ed;border-radius:14px;padding:20px;margin-bottom:16px}#login label{display:block;margin-bottom:8px}.filters{margin:15px 0}.entry p{font-size:14px;line-height:1.6;overflow-wrap:anywhere}.entry pre{white-space:pre-wrap;font-size:12px;line-height:1.6;overflow-wrap:anywhere}summary{cursor:pointer;font-size:13px}.meta{font-size:11px;color:#667e8f}.entry .row{margin-top:16px}#error{color:#a82c25}#overview{font-size:13px;line-height:1.6}a{color:#0868a6}[hidden]{display:none!important}
+/* 1. CSS Змінні для легкої зміни дизайну під будь-який бренд */
+:root {
+  --font-base: system-ui, -apple-system, sans-serif;
+  
+  /* Кольорова палітра ABV Хімія */
+  --c-bg: #eff4f8;
+  --c-text-main: #19334a;
+  --c-text-muted: #687e8e;
+  --c-brand: #0868a6;
+  --c-brand-hover: #0a79c2;
+  --c-brand-muted: #42728f;
+  --c-danger: #d32f2f;
+  
+  /* Поверхні та бордери */
+  --c-surface: #ffffff;
+  --c-border: #c5d8e4;
+  --c-border-light: #d5e3ed;
+  
+  /* Розміри */
+  --radius-sm: 8px;
+  --radius-lg: 14px;
+  --transition: 0.2s ease;
+}
+
+/* Підтримка темної теми "з коробки" */
+@media (prefers-color-scheme: dark) {
+  :root {
+    --c-bg: #121a21;
+    --c-text-main: #e0e6ed;
+    --c-text-muted: #8b9fb0;
+    --c-brand: #3ba4e6;
+    --c-brand-hover: #5ab5f2;
+    --c-surface: #1e2933;
+    --c-border: #2c3f4f;
+    --c-border-light: #2c3f4f;
+  }
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  padding: 32px 18px;
+  font-family: var(--font-base);
+  color: var(--c-text-main);
+  background: var(--c-bg);
+  line-height: 1.5;
+}
+
+main {
+  max-width: 980px;
+  margin: auto;
+}
+
+header, .row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+header {
+  justify-content: space-between;
+  margin-bottom: 28px;
+}
+
+.brand {
+  font-size: 11px;
+  letter-spacing: 1.2px;
+  color: var(--c-brand-muted);
+  text-transform: uppercase;
+  font-weight: 600;
+}
+
+h1 { font-size: 28px; margin: 8px 0; }
+h2 { font-size: 17px; }
+
+/* 2. Інтерактивні кнопки з Hover та Focus станами */
+button {
+  cursor: pointer;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  background: var(--c-surface);
+  color: var(--c-brand);
+  padding: 10px 16px;
+  font-weight: 500;
+  transition: all var(--transition);
+}
+
+button:hover:not(:disabled) {
+  background: var(--c-brand);
+  color: var(--c-surface);
+  border-color: var(--c-brand);
+}
+
+button:focus-visible {
+  outline: 2px solid var(--c-brand);
+  outline-offset: 2px;
+}
+
+button:active:not(:disabled) {
+  transform: translateY(1px);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  filter: grayscale(1);
+}
+
+/* 3. Форми з підсвіткою фокусу */
+input, select {
+  font: inherit;
+  padding: 10px 12px;
+  border: 1px solid var(--c-border);
+  border-radius: var(--radius-sm);
+  background: var(--c-surface);
+  color: var(--c-text-main);
+  transition: border-color var(--transition), box-shadow var(--transition);
+}
+
+input {
+  width: min(100%, 480px);
+}
+
+input:focus, select:focus {
+  outline: none;
+  border-color: var(--c-brand);
+  box-shadow: 0 0 0 3px rgba(8, 104, 166, 0.15);
+}
+
+input:invalid:not(:placeholder-shown) {
+  border-color: var(--c-danger);
+}
+
+label {
+  font-size: 13px;
+  font-weight: 500;
+}
+
+small {
+  display: block;
+  color: var(--c-text-muted);
+  margin-top: 6px;
+}
+
+/* 4. Картки та контейнери */
+#login, .entry {
+  background: var(--c-surface);
+  border: 1px solid var(--c-border-light);
+  border-radius: var(--radius-lg);
+  padding: 24px;
+  margin-bottom: 16px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.02);
+}
+
+#login label {
+  display: block;
+  margin-bottom: 8px;
+}
+
+.filters {
+  margin: 15px 0;
+}
+
+.entry p {
+  font-size: 14px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+}
+
+.entry pre {
+  white-space: pre-wrap;
+  font-size: 12px;
+  line-height: 1.6;
+  overflow-wrap: anywhere;
+  background: var(--c-bg);
+  padding: 12px;
+  border-radius: var(--radius-sm);
+}
+
+/* 5. Деталі та посилання */
+summary {
+  cursor: pointer;
+  font-size: 13px;
+  font-weight: 500;
+  user-select: none;
+  transition: color var(--transition);
+}
+
+summary:hover {
+  color: var(--c-brand);
+}
+
+.meta {
+  font-size: 11px;
+  color: var(--c-text-muted);
+}
+
+.entry .row {
+  margin-top: 16px;
+}
+
+#error {
+  color: var(--c-danger);
+  font-size: 13px;
+  font-weight: 500;
+  margin-top: 8px;
+}
+
+#overview {
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+a {
+  color: var(--c-brand);
+  text-decoration: none;
+  transition: color var(--transition);
+}
+
+a:hover {
+  color: var(--c-brand-hover);
+  text-decoration: underline;
+}
+
+[hidden] {
+  display: none !important;
+}
