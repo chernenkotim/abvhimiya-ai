@@ -170,8 +170,8 @@ def retrieval_query(message, history):
         extra = " гумова"
     elif any(k in q_lower for k in ("термо", "герметик", "високотемператур")):
         extra = " герметик термостійкий"
-    elif any(k in q_lower for k in ("нефрас", "уайт", "вайт", "розчинник", "растворител", "калош")):
-        extra = " нефрас уайт-спірит розчинник"
+    elif any(k in q_lower for k in ("нефрас", "уайт", "вайт", "розчинник", "растворител", "калош", "бр-2", "бр2")):
+        extra = " нефрас уайт-спірит калоша розчинник"
 
     return f"{message} {extra}".strip()
 
@@ -348,7 +348,7 @@ class Assistant:
                         result = await self.generate(message, history, items)
                         if result:
                             ai_reply, ids, ai_handoff = result
-                            matched_items = [p for p in items if str(getattr(p, 'id', '')) in [str(x).strip() for x in ids]]
+                            matched_items = [p for p in items if str(getattr(p, 'id', '')).strip() in ids]
                             if matched_items:
                                 items = matched_items
                             reply = ai_reply
@@ -372,19 +372,19 @@ class Assistant:
 
     async def generate(self, message, history, items):
         facts = []
-        for p in items[:4]:
+        for p in items[:3]:
             attrs = getattr(p, 'attributes', {})
             attrs_dict = attrs if isinstance(attrs, dict) else {}
             facts.append({
                 'id': str(getattr(p, 'id', '')),
                 'name': str(getattr(p, 'name', '')),
-                'description': str(getattr(p, 'description', '') or '')[:1400],
-                'attributes': {str(k)[:60]: str(v)[:250] for k, v in list(attrs_dict.items())[:25]}
+                'description': str(getattr(p, 'description', '') or '')[:500],
+                'attributes': {str(k)[:40]: str(v)[:150] for k, v in list(attrs_dict.items())[:8]}
             })
 
         payload = {
             'facts': facts,
-            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:600]} for h in history[-6:]],
+            'history': [{'role': str(h.get('role', 'user')), 'text': redact(str(h.get('text', '')))[:300]} for h in history[-4:]],
             'message': redact(str(message))
         }
 
@@ -397,14 +397,14 @@ class Assistant:
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}],
             'generationConfig': {
                 'temperature': 0.1,
-                'maxOutputTokens': 800,
+                'maxOutputTokens': 500,
                 'responseMimeType': 'application/json'
             }
         }
 
         try:
-            async with asyncio.timeout(12):
-                async with self.semaphore, httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
+            async with asyncio.timeout(18):
+                async with self.semaphore, httpx.AsyncClient(timeout=16, follow_redirects=False) as client:
                     response = await client.post(
                         f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent',
                         headers={'x-goog-api-key': self.settings.gemini_key},
