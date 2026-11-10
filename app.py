@@ -2,6 +2,7 @@
 import asyncio
 from contextlib import asynccontextmanager
 import hashlib
+import html
 import json
 import logging
 from pathlib import Path
@@ -13,7 +14,7 @@ import weakref
 from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, field_validator
@@ -65,7 +66,7 @@ class BodyLimit:
             if message['type'] == 'http.disconnect': 
                 return
             body.extend(message.get('body', b''))
-            if len(body) > 32768:
+            if len(body) > 65536:
                 return await JSONResponse({'detail': 'Запит завеликий'}, status_code=413)(scope, receive, send)
             if not message.get('more_body', False): 
                 break
@@ -101,8 +102,8 @@ def create_app(settings=None):
                         store.finish_notification(lead_item, ok, error)
             except asyncio.CancelledError: 
                 raise
-            except Exception: 
-                log.error('Notification worker failed; requests remain in database')
+            except Exception as e: 
+                log.error(f'Notification worker failed: {e}; requests remain in database')
             await asyncio.sleep(5)
 
     async def cleanup_loop():
@@ -168,10 +169,10 @@ def create_app(settings=None):
     def limit(request, kind, session_val=None):
         rules = [
             ('ip:' + ip_key(request), 90, 60),
-            ('ip:' + kind + ':' + ip_key(request), {'session': 15, 'chat': 30, 'lead': 8, 'admin': 30}.get(kind, 30), 60)
+            ('ip:' + kind + ':' + ip_key(request), {'session': 20, 'chat': 40, 'lead': 10, 'admin': 40}.get(kind, 30), 60)
         ]
         if session_val:
-            rules.append(('session:' + kind + ':' + session_val, {'chat': 25, 'lead': 6}.get(kind, 30), 60))
+            rules.append(('session:' + kind + ':' + session_val, {'chat': 35, 'lead': 8}.get(kind, 30), 60))
         if not store.allow(rules): 
             raise HTTPException(429, 'Забагато запитів. Спробуйте за хвилину.', headers={'Retry-After': '60'})
 
@@ -197,7 +198,8 @@ def create_app(settings=None):
     async def admin_auth(request: Request, authorization: str = Header(default='')):
         import hmac
         limit(request, 'admin')
-        if not settings.admin_token or not hmac.compare_digest(authorization, 'Bearer ' + settings.admin_token):
+        token = authorization.replace('Bearer ', '').strip() if authorization.startswith('Bearer ') else ''
+        if not settings.admin_token or not hmac.compare_digest(token, settings.admin_token):
             raise HTTPException(401, 'Потрібна авторизація', headers={'WWW-Authenticate': 'Bearer'})
 
     @app.get('/')
@@ -324,6 +326,8 @@ def create_app(settings=None):
             'message': 'Заявку збережено! Менеджер зв’яжеться з вами найближчим часом.'
         }
 
+    # --- АДМІН-ПАНЕЛЬ ТА ПЕРЕГЛЯД ДІАЛОГІВ ---
+
     @app.get('/admin/overview', dependencies=[Depends(admin_auth)])
     async def get_overview():
         return {
@@ -344,6 +348,11 @@ def create_app(settings=None):
             raise HTTPException(422, 'Некоректний фільтр')
         return store.list_leads(state, limit, offset)
 
+    @app.get('/admin/dialogs-data', dependencies=[Depends(admin_auth)])
+    async def get_dialogs_data(limit: int = 50, offset: int = 0):
+        """API-ендпоінт для отримання списку останніх розмов клієнтів."""
+        return store.list_dialogs(limit=min(limit, 100), offset=offset)
+
     @app.patch('/admin/leads/{request_id}', dependencies=[Depends(admin_auth)])
     async def update_lead_state(request_id: UUID, body: LeadState):
         if not store.set_state(str(request_id), body.state): 
@@ -361,23 +370,35 @@ def create_app(settings=None):
 async def send_telegram(settings, lead_obj):
     data = lead_obj['payload']
     product = data.get('product')
+    
+    # Екранування HTML-символів для уникнення помилок парсингу Telegram
+    lead_id_safe = html.escape(str(lead_obj['id']))
+    name_safe = html.escape(data.get('name') or 'Не вказано')
+    phone_safe = html.escape(str(data.get('phone', '')))
+    
     lines = [
         '⚡ <b>ЗАЯВКА З ЧАТУ ABV ХІМІЯ</b>',
-        f"<b>ID:</b> <code>{lead_obj['id']}</code>",
-        f"<b>Ім’я:</b> {data['name'] or 'Не вказано'}",
-        f"<b>Телефон:</b> <code>{data['phone']}</code>"
+        f"<b>ID:</b> <code>{lead_id_safe}</code>",
+        f"<b>Ім’я:</b> {name_safe}",
+        f"<b>Телефон:</b> <code>{phone_safe}</code>"
     ]
     if product:
-        lines.append(f"<b>Товар:</b> {product['name']} (Арт: {product.get('vendor_code', product['id'])})")
-    if data['note']:
-        lines.append(f"<b>Коментар:</b> {data['note']}")
+        p_name = html.escape(str(product.get('name', '')))
+        p_sku = html.escape(str(product.get('vendor_code', product.get('id', ''))))
+        lines.append(f"<b>Товар:</b> {p_name} (Арт: {p_sku})")
+    if data.get('note'):
+        lines.append(f"<b>Коментар:</b> {html.escape(str(data['note']))}")
     
     if data.get('context'):
-        ctx_lines = [f"{h['role']}: {h['text']}" for h in data['context'][-4:]]
-        lines.append('<b>Діалог:</b>\n<i>' + '\n'.join(ctx_lines) + '</i>')
+        ctx_lines = []
+        for h in data['context'][-4:]:
+            role_name = 'Клієнт' if h.get('role') == 'user' else 'Бот'
+            txt = html.escape(str(h.get('text', '')))
+            ctx_lines.append(f"<b>{role_name}:</b> {txt}")
+        lines.append('\n<b>Останні репліки діалогу:</b>\n' + '\n'.join(ctx_lines))
 
     try:
-        async with httpx.AsyncClient(timeout=8, follow_redirects=False) as client:
+        async with httpx.AsyncClient(timeout=10, follow_redirects=False) as client:
             r = await client.post(
                 f'https://api.telegram.org/bot{settings.telegram_token}/sendMessage',
                 json={
@@ -388,8 +409,10 @@ async def send_telegram(settings, lead_obj):
                 }
             )
             r.raise_for_status()
-            return bool(r.json().get('ok')), None if r.json().get('ok') else 'Telegram rejected message'
-    except Exception:
-        return False, 'Telegram delivery not confirmed'
+            res_json = r.json()
+            return bool(res_json.get('ok')), None if res_json.get('ok') else 'Telegram rejected message'
+    except Exception as e:
+        log.warning(f"Telegram notification send error: {e}")
+        return False, f'Telegram error: {e}'
 
 app = create_app()
