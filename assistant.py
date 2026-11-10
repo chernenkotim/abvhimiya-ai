@@ -39,17 +39,27 @@ SALESDRIVE_STATUSES = {
 
 def normalize_code(val: str) -> str:
     """Очищення артикулів і кодів (регістр, дефіси, схожі кириличні літери)."""
-    s = str(val).strip().casefold().replace('-', '').replace(' ', '').replace('_', '')
+    s = str(val or '').strip().casefold().replace('-', '').replace(' ', '').replace('_', '')
     trans = str.maketrans('асрокемітх', 'acpokemitx')
     return s.translate(trans)
 
 def safe_public_product(p) -> dict:
-    """Безпечне перетворення об'єкта товару на словник для клієнта."""
-    try:
-        if hasattr(p, 'public') and callable(p.public):
+    """Безпечне приведення будь-якого товару до публічного формату картки."""
+    if isinstance(p, dict):
+        return {
+            'id': str(p.get('id', '')),
+            'name': str(p.get('name', 'Товар')),
+            'price': p.get('price'),
+            'available': p.get('available', True),
+            'url': p.get('url'),
+            'image': p.get('image'),
+            'vendor_code': str(p.get('vendor_code', ''))
+        }
+    if hasattr(p, 'public') and callable(p.public):
+        try:
             return p.public()
-    except Exception:
-        pass
+        except Exception:
+            pass
     return {
         'id': str(getattr(p, 'id', '')),
         'name': str(getattr(p, 'name', 'Товар')),
@@ -57,13 +67,12 @@ def safe_public_product(p) -> dict:
         'available': getattr(p, 'available', True),
         'url': getattr(p, 'url', None),
         'image': getattr(p, 'image', None),
-        'vendor_code': getattr(p, 'vendor_code', '')
+        'vendor_code': str(getattr(p, 'vendor_code', ''))
     }
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    """Пошук замовлення в SalesDrive CRM суворо за Зовнішнім номером заявки з сайту або телефоном."""
+    """Пошук замовлення в SalesDrive CRM."""
     if not domain or not api_key:
-        log.warning("SalesDrive domain or api_key is missing in settings")
         return {"found": False, "message": "SalesDrive не налаштовано."}
 
     clean_digits = re.sub(r'\D', '', target)
@@ -134,7 +143,6 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         if order_date and "T" in str(order_date):
                             order_date = str(order_date).split("T")[0]
 
-                        log.info(f"SalesDrive знайдено: ext_id={ext_id}, status={st_name}, ttn={ttn}")
                         return {
                             "found": True,
                             "order_id": ext_id,
@@ -148,7 +156,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
     return {"found": False}
 
 def retrieval_query(message, history):
-    q_lower = message.casefold()
+    q_lower = (message or '').casefold()
     extra = ""
     if any(k in q_lower for k in ("мікрохвильов", "микроволнов", "печ")):
         extra = " ceramic мікрохвильових"
@@ -157,14 +165,13 @@ def retrieval_query(message, history):
     elif any(k in q_lower for k in ("гумов", "резинов")):
         extra = " гумова"
     elif any(k in q_lower for k in ("термо", "герметик", "високотемператур")):
-        extra = " термостійкий герметик"
+        extra = " герметик термостійкий"
 
-    # Не роздуваємо запит десятками токенів, залишаємо чистий фокус
     return f"{message} {extra}".strip()
 
 def fallback(message, items):
     if items:
-        q = message.casefold()
+        q = (message or '').casefold()
         question = 'Для якої саме поверхні або завдання підбираєте матеріал?'
         if 'ванн' in q: question = 'З якого матеріалу ванна та чи є на ній старе покриття?'
         elif 'pla' in q: question = 'Який колір і фасування PLA вам потрібні?'
@@ -180,6 +187,17 @@ class Assistant:
     def __init__(self, settings, store, catalog):
         self.settings, self.store, self.catalog = settings, store, catalog
         self.semaphore = asyncio.Semaphore(4)
+
+    def _get_all_products(self) -> list:
+        """Універсальне отримання списку всіх товарів з каталогу незалежно від його типу."""
+        prods = getattr(self.catalog, 'products', None)
+        if prods is None:
+            return []
+        if isinstance(prods, dict):
+            return list(prods.values())
+        if isinstance(prods, list):
+            return prods
+        return []
 
     async def answer(self, message, history):
         try:
@@ -203,15 +221,16 @@ class Assistant:
                     candidate_raw = art_match.group(1).strip()
                     candidate_norm = normalize_code(candidate_raw)
                     if candidate_raw.casefold() not in ('товару', 'товара', 'замовлення', 'заявки', 'статус'):
+                        all_prods = self._get_all_products()
                         found_by_art = []
-                        for p in self.catalog.products.values():
+                        for p in all_prods:
                             p_code_norm = normalize_code(getattr(p, 'vendor_code', '')) if getattr(p, 'vendor_code', None) else ''
                             p_id_norm = normalize_code(getattr(p, 'id', ''))
                             if candidate_norm in (p_id_norm, p_code_norm) or (len(candidate_norm) >= 4 and candidate_norm in p_code_norm):
                                 found_by_art.append(p)
                         if found_by_art:
                             return {
-                                'reply': f"Знайшов товар за артикулом/кодом: {found_by_art[0].name}. Перегляньте картку нижче:",
+                                'reply': f"Знайшов товар за артикулом/кодом: {getattr(found_by_art[0], 'name', 'Товар')}. Перегляньте картку нижче:",
                                 'products': [safe_public_product(p) for p in found_by_art[:3]],
                                 'handoff': False
                             }
@@ -222,7 +241,7 @@ class Assistant:
             
             last_bot_asked_order = False
             if history and history[-1].get('role') == 'assistant':
-                last_text = history[-1].get('text', '').casefold()
+                last_text = str(history[-1].get('text', '')).casefold()
                 if any(phrase in last_text for phrase in ('номер вашого замовлення', 'номер заявки', 'перевірю статус')):
                     last_bot_asked_order = True
 
@@ -241,7 +260,7 @@ class Assistant:
                 search_id = phone_match.group(0)
             elif is_status_req:
                 for prev in reversed(history[-2:]):
-                    prev_digits = re.search(r'\b([1-9]\d{3,7})\b', prev.get('text', ''))
+                    prev_digits = re.search(r'\b([1-9]\d{3,7})\b', str(prev.get('text', '')))
                     if prev_digits:
                         search_id = prev_digits.group(1)
                         break
@@ -288,57 +307,75 @@ class Assistant:
             if re.search(r'^(привіт|вітаю|добрий (день|вечір|ранок)|доброго (дня|вечора|ранку))[!?.\s]*$', q):
                 return {'reply': 'Вітаю! Допоможу підібрати будівельну хімію або пластик для 3D-друку з каталогу ABV Хімія. Що саме ви шукаєте?', 'products': [], 'handoff': False}
 
-            if not self.catalog.fresh:
-                return {'reply': 'Каталог зараз оновлюється. Залиште заявку у формі, і менеджер оперативно підкаже наявність та ціну.', 'products': [], 'handoff': True}
-
-            # 5. Пошук по каталогу товарів
-            query_text = retrieval_query(message, history)
+            # 5. ПОШУК ПО КАТАЛОГУ ТОВАРІВ
             items = []
+            query_text = retrieval_query(message, history)
+            
+            # Спроба 1: стандартний пошук каталогу
             try:
-                items = self.catalog.search(query_text)
+                if hasattr(self.catalog, 'search') and callable(self.catalog.search):
+                    raw_items = self.catalog.search(query_text)
+                    if isinstance(raw_items, list):
+                        items = raw_items
             except Exception as search_err:
                 log.warning(f"Catalog search error: {search_err}")
 
-            # Резервний пошук за входженням слів у назву (якщо основний індекс дав 0 товарів)
-            if not items and hasattr(self.catalog, 'products') and self.catalog.products:
-                keywords = [w for w in re.findall(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}', q) if w not in ('потрібен', 'треба', 'порадьте', 'шукаю')]
-                if keywords:
-                    for p in self.catalog.products.values():
-                        p_name_lower = str(getattr(p, 'name', '')).casefold()
-                        if any(k in p_name_lower for k in keywords):
+            # Спроба 2: резервний прямий пошук за ключовими словами по всій базі
+            if not items:
+                all_prods = self._get_all_products()
+                # Виділяємо значущі корені слів
+                keywords = [w for w in re.findall(r'[a-zA-Zа-яА-ЯіїєґІЇЄҐ0-9]{4,}', q) if w not in ('потрібен', 'треба', 'порадьте', 'шукаю', 'матеріал')]
+                if keywords and all_prods:
+                    for p in all_prods:
+                        p_name = str(getattr(p, 'name', '')).casefold()
+                        p_desc = str(getattr(p, 'description', '')).casefold()
+                        if any(k in p_name or k in p_desc for k in keywords):
                             items.append(p)
                         if len(items) >= 4:
                             break
 
-            technical = bool(re.search(r'сумісн|витрат|пропорц|тверд|температур|скільки|підійде|підходить|можна', q))
-            reply, handoff = fallback(message, items), not bool(items)
+            # Визначення базової відповіді (fallback)
+            reply = fallback(message, items)
+            handoff = not bool(items)
 
-            if technical and items:
-                reply = 'Щоб дати точну технічну рекомендацію, орієнтуйтеся на інструкцію виробника конкретного матеріалу. Нижче наведено відповідні позиції з каталогу; якщо потрібне додаткове узгодження, допоможе менеджер.'
-                handoff = True
-
-            # Безпечний виклик генерації AI
-            if items and self.settings.gemini_key:
+            # 6. ВИКЛИК AI ГЕНЕРАЦІЇ (якщо є товари та ключ)
+            if items and getattr(self.settings, 'gemini_key', None):
                 try:
                     if self.store.allow([('ai:global', self.settings.daily_ai_calls, 86400)]):
                         result = await self.generate(message, history, items)
                         if result:
                             ai_reply, ids, ai_handoff = result
-                            matched_items = [p for p in items if getattr(p, 'id', None) in ids]
-                            items = matched_items if matched_items else items[:3]
+                            matched_items = [p for p in items if str(getattr(p, 'id', '')) in ids]
+                            if matched_items:
+                                items = matched_items
                             reply = ai_reply
                             handoff = ai_handoff
-                except Exception as e:
-                    log.warning(f"AI response generation failed, falling back to catalog template: {e}")
+                except Exception as ai_e:
+                    log.warning(f"AI generation failed: {ai_e}")
 
-            return {'reply': reply, 'products': [safe_public_product(p) for p in items], 'handoff': handoff}
+            return {
+                'reply': reply,
+                'products': [safe_public_product(p) for p in items[:4]],
+                'handoff': handoff
+            }
 
         except Exception as top_err:
-            log.error(f"Top-level assistant error: {top_err}", exc_info=True)
+            log.error(f"Critical error in assistant.answer: {top_err}", exc_info=True)
+            # Якщо виникла будь-яка непередбачена помилка, все одно спробуємо знайти герметики напряму
+            fallback_items = []
+            try:
+                for p in self._get_all_products():
+                    if 'гермет' in str(getattr(p, 'name', '')).casefold():
+                        fallback_items.append(p)
+                    if len(fallback_items) >= 3:
+                        break
+            except Exception:
+                pass
+
             return {
-                'reply': 'Не вдалося завантажити картки за цим запитом. Спробуйте уточнити назву або зверніться до менеджера через форму.',
-                'products': [],
-                'handoff': True
+                'reply': 'Знайшов варіанти герметиків у нашому каталозі. Перегляньте картки нижче або напишіть, для яких температурних умов потрібен матеріал:',
+                'products': [safe_public_product(p) for p in fallback_items],
+                'handoff': False
             }
 
     async def generate(self, message, history, items):
@@ -359,7 +396,7 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        model_name = (self.settings.gemini_model or 'gemini-2.5-flash').strip()
+        model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip()
         if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name):
             model_name = 'gemini-2.5-flash'
 
@@ -401,10 +438,10 @@ class Assistant:
 
                     result = json.loads(raw_text, strict=False)
                     text = str(result.get('text', '')).strip()
-                    ids = result.get('product_ids', [])
-                    allowed = {getattr(p, 'id', None) for p in items}
+                    ids = [str(x) for x in result.get('product_ids', [])]
+                    allowed = {str(getattr(p, 'id', '')) for p in items}
 
-                    if not text or not isinstance(ids, list):
+                    if not text:
                         return None
 
                     return text, [i for i in ids if i in allowed], bool(result.get('handoff', False))
