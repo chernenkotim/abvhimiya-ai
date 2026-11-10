@@ -388,9 +388,9 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip()
-        if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name):
-            model_name = 'gemini-2.5-flash'
+        model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip()
+        if not re.fullmatch(r'[A-Za-z0-9._-]+', model_name) or '2.5' in model_name:
+            model_name = 'gemini-3.8-flash'
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
