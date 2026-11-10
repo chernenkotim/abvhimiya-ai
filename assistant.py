@@ -62,7 +62,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
         "User-Agent": "ABV-AI-Assistant/3.0"
     }
 
-    # Формуємо прямі URL, щоб уникнути некоректного екранування фільтра
+    # Прямі URL-запити для пошуку заявки
     urls_to_try = []
     if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
         urls_to_try.append(f"{base_url}?filter[externalId]={query_str}")
@@ -84,10 +84,31 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
                         m = orders[0]
-                        ext_id = m.get("externalId") or m.get("id") or query_str
+                        internal_id = m.get("id")
+                        ext_id = m.get("externalId") or internal_id or query_str
 
-                        # Визначення текстової назви статусу
-                        st = m.get("status")
+                        # Якщо в базовому списку ТТН не знайдено, робимо запит за повною карткою заявки
+                        full_card_data = {}
+                        if internal_id:
+                            try:
+                                single_res = await client.get(f"https://{clean_domain}/api/order/{internal_id}/", headers=headers)
+                                if single_res.status_code == 200:
+                                    single_json = single_res.json()
+                                    full_card_data = single_json.get("data", {}) or single_json
+                            except Exception as sub_e:
+                                log.warning(f"Error fetching full order details: {sub_e}")
+
+                        # Об'єднуємо всі отримані дані в один JSON-рядок для гарантованого вилучення ТТН
+                        combined_dump = json.dumps([m, full_card_data], ensure_ascii=False)
+
+                        # Експрес-накладна Нової Пошти: 14 цифр, що починаються з 204, 59, 10, 205 тощо
+                        ttn = ""
+                        ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', combined_dump)
+                        if ttn_match:
+                            ttn = ttn_match.group(1)
+
+                        # Визначення статусу
+                        st = m.get("status") or full_card_data.get("status")
                         if isinstance(st, dict):
                             st_name = st.get("text", "В обробці")
                         elif isinstance(st, str) and st:
@@ -97,41 +118,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         else:
                             st_name = "В обробці"
 
-                        # Отримання ТТН Нової Пошти з усіх можливих блоків інтеграції SalesDrive
-                        delivery = m.get("ord_delivery_data") if isinstance(m.get("ord_delivery_data"), dict) else {}
-                        np_data = m.get("novaposhta") if isinstance(m.get("novaposhta"), dict) else {}
-                        deliv_gen = m.get("deliveryData") if isinstance(m.get("deliveryData"), dict) else {}
-
-                        ttn_candidates = [
-                            m.get("trackingNumber"),
-                            m.get("ttn"),
-                            m.get("enumber"),
-                            m.get("declarationNumber"),
-                            delivery.get("trackingNumber"),
-                            delivery.get("ttn"),
-                            delivery.get("enumber"),
-                            delivery.get("declarationNumber"),
-                            np_data.get("trackingNumber"),
-                            np_data.get("enumber"),
-                            np_data.get("intDocNumber"),
-                            deliv_gen.get("trackingNumber"),
-                            deliv_gen.get("enumber"),
-                        ]
-
-                        for k, v in m.items():
-                            if any(sub in k.lower() for sub in ("ttn", "track", "enumber", "nakladn")):
-                                if isinstance(v, (str, int)):
-                                    ttn_candidates.append(str(v))
-
-                        ttn = ""
-                        for cand in ttn_candidates:
-                            if cand:
-                                clean_cand = re.sub(r'\D', '', str(cand))
-                                if len(clean_cand) in (11, 14) or (len(clean_cand) >= 10 and clean_cand.startswith(('2', '5', '1'))):
-                                    ttn = clean_cand
-                                    break
-
-                        order_date = m.get("orderTime") or m.get("orderDate") or ""
+                        order_date = m.get("orderTime") or m.get("orderDate") or full_card_data.get("orderTime") or ""
                         if order_date and "T" in str(order_date):
                             order_date = str(order_date).split("T")[0]
 
