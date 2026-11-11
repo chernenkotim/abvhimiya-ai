@@ -73,25 +73,32 @@ def safe_public_product(p) -> dict:
     }
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    if not domain or not api_key: return {"found": False}
+    if not domain or not api_key: 
+        return {"found": False}
     clean_digits = re.sub(r'\D', '', target)
     query_str = clean_digits if clean_digits else target.strip()
-    if not query_str: return {"found": False}
+    if not query_str: 
+        return {"found": False}
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.3"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.4"}
 
-    urls_to_try = [
-        f"{base_url}?filter[externalId]={query_str}",
-        f"{base_url}?filter[search]={query_str}"
-    ] if len(clean_digits) <= 8 else [
-        f"{base_url}?filter[phone]={clean_digits[-10:]}",
-        f"{base_url}?filter[phone]=38{clean_digits[-10:]}"
-    ]
+    if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
+        urls_to_try = [
+            f"{base_url}?filter[id]={query_str}",
+            f"{base_url}?filter[externalId]={query_str}",
+            f"{base_url}?filter[search]={query_str}"
+        ]
+    else:
+        phone_10 = clean_digits[-10:] if len(clean_digits) >= 10 else clean_digits
+        urls_to_try = [
+            f"{base_url}?filter[phone]={phone_10}",
+            f"{base_url}?filter[phone]=38{phone_10}"
+        ]
 
     try:
-        async with httpx.AsyncClient(timeout=4, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
             for req_url in urls_to_try:
                 res = await client.get(req_url, headers=headers)
                 if res.status_code == 200:
@@ -99,11 +106,25 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
                         m = orders[0]
+                        ext_id = m.get("externalId") or m.get("id") or query_str
                         st = m.get("status") or "В обробці"
                         st_name = st.get("text", "В обробці") if isinstance(st, dict) else str(st)
-                        return {"found": True, "order_id": m.get("externalId") or m.get("id"), "status": st_name}
-    except Exception:
-        pass
+                        
+                        ttn = ""
+                        for field_name in ("trackingNumber", "ttn", "deliveryNumber"):
+                            if m.get(field_name):
+                                ttn = str(m[field_name])
+                                break
+
+                        return {
+                            "found": True, 
+                            "order_id": ext_id, 
+                            "status": st_name, 
+                            "ttn": ttn
+                        }
+    except Exception as e:
+        log.warning(f"SalesDrive lookup error: {e}")
+
     return {"found": False}
 
 class Assistant:
@@ -140,7 +161,54 @@ class Assistant:
             if any(w in q for w in ('зміша', 'смеша')) and any(w in q for w in ('хлор', 'відбілювач', 'аміак', 'кислот')):
                 return {'reply': 'Не змішуйте ці засоби: можливе виділення небезпечних токсичних газів!', 'products': [], 'handoff': True}
 
-            # 2. Пошук супутніх товарів у каталозі
+            # 2. СТАТУС ЗАМОВЛЕННЯ В CRM (SalesDrive)
+            order_patterns = [
+                r'(?:номер\s+)?(?:замовленн\w*|заявк\w*|посилк\w*|чек\w*|№|#)\s*[:№#\s]*([1-9]\d{3,7})\b',
+                r'\b([1-9]\d{3,7})\b'
+            ]
+            
+            search_id = None
+            is_order_intent = bool(re.search(r'замовленн|заявк|статус|ттн|де посилка|де моє', q))
+            
+            phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
+            if phone_match and is_order_intent:
+                search_id = phone_match.group(0)
+            else:
+                for pattern in order_patterns:
+                    m = re.search(pattern, q, re.IGNORECASE)
+                    if m:
+                        if pattern == r'\b([1-9]\d{3,7})\b' and not is_order_intent and len(q.split()) > 2:
+                            continue
+                        search_id = m.group(1)
+                        break
+
+            if search_id:
+                info = await fetch_salesdrive_status(
+                    self.settings.salesdrive_domain, 
+                    self.settings.salesdrive_key, 
+                    search_id
+                )
+                if info.get("found"):
+                    ttn_text = f"\n• ТТН: {info['ttn']}" if info.get('ttn') else ""
+                    return {
+                        'reply': f"Замовлення №{info['order_id']}:\n• Статус: {info['status']}{ttn_text}",
+                        'products': [],
+                        'handoff': False
+                    }
+                return {
+                    'reply': f"Замовлення за номером '{search_id}' не знайдено в базі. Будь ласка, перевірте правильність номера або залиште заявку менеджеру.",
+                    'products': [],
+                    'handoff': True
+                }
+
+            if is_order_intent and not search_id:
+                return {
+                    'reply': "Вкажіть номер замовлення (наприклад, 19178) або ваш номер телефону для перевірки статусу.",
+                    'products': [],
+                    'handoff': False
+                }
+
+            # 3. DIRECT EXPERT FAQ: Миттєва відповідь на поширені порівняння (0.05 сек)
             items = []
             try:
                 if hasattr(self.catalog, 'search') and callable(self.catalog.search):
@@ -148,7 +216,6 @@ class Assistant:
             except Exception as e:
                 log.warning(f"Catalog search error: {e}")
 
-            # 3. DIRECT EXPERT FAQ: Миттєва відповідь на поширені порівняння (0.05 сек)
             if 'нефрас' in q and ('уайт' in q or 'вайт' in q):
                 reply_text = EXPERT_KNOWLEDGE["нефрас_уайт"]
                 return {'reply': reply_text, 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
@@ -166,23 +233,11 @@ class Assistant:
                     if found:
                         return {'reply': "Знайшов позицію за артикулом:", 'products': [safe_public_product(p) for p in found[:3]], 'handoff': False}
 
-            # 5. Статус замовлення в CRM
-            if re.search(r'статус|ттн|де (?:моє )?замовлення|де посилка', q):
-                phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
-                order_match = re.search(r'\b([1-9]\d{3,7})\b', q)
-                search_id = phone_match.group(0) if phone_match else (order_match.group(1) if order_match else None)
-                if search_id:
-                    info = await fetch_salesdrive_status(self.settings.salesdrive_domain, self.settings.salesdrive_key, search_id)
-                    if info.get("found"):
-                        return {'reply': f"Замовлення №{info['order_id']} — статус: {info['status']}", 'products': [], 'handoff': False}
-                    return {'reply': f"Замовлення за номером '{search_id}' не знайдено.", 'products': [], 'handoff': True}
-                return {'reply': "Вкажіть номер замовлення або телефон для перевірки статусу.", 'products': [], 'handoff': False}
-
-            # 6. Ввічливі фрази
+            # 5. Ввічливі фрази
             if re.fullmatch(r'(?:дякую|спасибі|ок|добре)[!.\s]*', q):
                 return {'reply': 'Будь ласка! Якщо потрібна допомога з вибором матеріалів — звертайтеся.', 'products': [], 'handoff': False}
 
-            # 7. Генерація відповіді через Gemini AI
+            # 6. Генерація відповіді через Gemini AI
             if getattr(self.settings, 'gemini_key', None):
                 result = await self.generate(message, history, items)
                 if result:
@@ -199,7 +254,7 @@ class Assistant:
                         'handoff': ai_handoff
                     }
 
-            # 8. Резервна відповідь (якщо ШІ не відповів)
+            # 7. Резервна відповідь (якщо ШІ не відповів)
             return {
                 'reply': 'Підібрав відповідні матеріали з каталогу ABV Хімія. Перегляньте варіанти нижче або запитайте в нашого консультанта:',
                 'products': [safe_public_product(p) for p in items[:4]],
@@ -225,10 +280,11 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # Моделі для обробки
         cfg_model = (getattr(self.settings, 'gemini_model', '') or '').strip().replace('models/', '')
-        models_to_try = [cfg_model] if cfg_model and cfg_model not in ('gemini-3.8-flash',) else []
-        for m in ['gemini-2.5-flash', 'gemini-2.5-flash-lite']:
+        models_to_try = []
+        if cfg_model and cfg_model not in ('gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.8-flash'):
+            models_to_try.append(cfg_model)
+        for m in ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']:
             if m not in models_to_try:
                 models_to_try.append(m)
 
