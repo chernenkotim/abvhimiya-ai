@@ -73,6 +73,13 @@
             <button id="btnTabDialogs" class="tab-btn" onclick="switchTab('dialogs')">Живі діалоги чату (<span id="dialogs-count">0</span>)</button>
         </div>
 
+        <!-- Пошук по всьому -->
+        <div style="margin-bottom: 20px;">
+            <input type="search" id="search-box" placeholder="🔍 Пошук за телефоном, іменем або текстом..." 
+                   oninput="filterData()" 
+                   style="width: 100%; padding: 12px 16px; border: 1px solid var(--border); border-radius: 8px; font-size: 14px;">
+        </div>
+
         <div id="leads-controls" class="filters">
             <label for="filter" style="font-size:14px; font-weight:500;">Фільтр:</label>
             <select id="filter" onchange="resetPage(); loadLeads();">
@@ -125,6 +132,24 @@
             .replace(/'/g, '&#039;');
     }
 
+    // Миттєвий пошук по заявках та діалогах
+    window.filterData = function() {
+        const query = document.getElementById('search-box').value.toLowerCase();
+        const activeContainer = currentTab === 'leads' ? 'leads' : 'dialogs';
+        const cards = document.querySelectorAll(`#${activeContainer} > div, #${activeContainer} > details`);
+        
+        let found = 0;
+        cards.forEach(card => {
+            const text = card.textContent.toLowerCase();
+            if (text.includes(query)) {
+                card.style.display = '';
+                found++;
+            } else {
+                card.style.display = 'none';
+            }
+        });
+    };
+
     function init() {
         loadOverview();
         refreshData();
@@ -155,7 +180,6 @@
     }
 
     async function api(path, opts = {}) {
-        // Обов'язково передаємо credentials для Basic Auth
         opts.credentials = 'same-origin'; 
         if (!opts.headers) opts.headers = {};
         if (opts.method && opts.method !== 'GET') {
@@ -166,7 +190,7 @@
             const res = await fetch(path, opts);
             if (!res.ok) {
                 if (res.status === 401) {
-                    window.location.reload(); // Спонукає браузер показати вікно логіну
+                    window.location.reload();
                     return;
                 }
                 const errData = await res.json().catch(() => ({}));
@@ -247,6 +271,9 @@
                     </div>
                 `;
             }).join('');
+            
+            // Застосовуємо фільтр, якщо користувач щось шукав
+            filterData();
         } catch (e) {}
     }
 
@@ -266,7 +293,6 @@
             container.innerHTML = data.dialogs.map(d => {
                 const dateStr = new Date(d.updated * 1000).toLocaleString('uk-UA');
                 const msgs = d.messages || [];
-                // Шукаємо перше повідомлення користувача, щоб вивести як заголовок
                 const firstUserMsg = msgs.find(m => m.role === 'user')?.text || 'Порожній діалог';
 
                 const chatHtml = msgs.map(m => {
@@ -291,6 +317,9 @@
                     </details>
                 `;
             }).join('');
+            
+            // Застосовуємо фільтр, якщо користувач щось шукав
+            filterData();
         } catch (e) {}
     }
 
