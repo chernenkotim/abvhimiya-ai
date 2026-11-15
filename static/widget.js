@@ -245,12 +245,14 @@
     fields.forEach(id => $(id).disabled = true);
 
     try {
+      const urlParams = new URLSearchParams(window.location.search);
       const data = await post('/api/manager-request', {
         request_id: requestId,
         name: $('name').value.trim(),
         phone: $('phone').value.trim(),
         note: $('note').value.trim(),
         product_id: selectedProduct?.id || null,
+        page_url: urlParams.get('page') || window.location.href, // ТУТ ЗМІНА
         consent: $('consent').checked
       });
       $('lead-dialog').close();
