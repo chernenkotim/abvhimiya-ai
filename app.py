@@ -14,7 +14,6 @@ from dotenv import load_dotenv
 from fastapi import FastAPI, Depends, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response
-from fastapi.security import HTTPBasic, HTTPBasicCredentials
 from fastapi.staticfiles import StaticFiles
 import httpx
 from pydantic import BaseModel, Field, field_validator
@@ -43,6 +42,7 @@ class LeadRequest(SessionRequest):
     phone: str = Field(max_length=32)
     note: str = Field(default='', max_length=1000)
     product_id: str | None = Field(default=None, max_length=120)
+    page_url: str | None = Field(default=None, max_length=2000) # ДОДАНО: сторінка сайту
     consent: bool = False
 
     @field_validator('phone')
@@ -78,8 +78,6 @@ class BodyLimit:
                 return {'type': 'http.request', 'body': bytes(body), 'more_body': False}
             return await receive()
         await self.app(scope, replay, send)
-
-security = HTTPBasic()
 
 def create_app(settings=None):
     settings = (settings or Settings.from_env()).validate()
@@ -124,7 +122,6 @@ def create_app(settings=None):
             for task in tasks: 
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-            # Закриваємо пули з'єднань асистента
             if hasattr(assistant, 'aclose'):
                 await assistant.aclose()
             store.close()
@@ -200,19 +197,9 @@ def create_app(settings=None):
         except (ValueError, TypeError): 
             raise HTTPException(403, 'Сесія недійсна або завершилася', headers={'X-Session-Expired': '1'})
 
-    # Базова авторизація для адмінки
-    async def admin_auth(request: Request, credentials: HTTPBasicCredentials = Depends(security)):
+    # ДОДАНО: Заглушка авторизації, щоб пускати без пароля
+    async def admin_auth(request: Request):
         limit(request, 'admin')
-        
-        correct_username = secrets.compare_digest(credentials.username, getattr(settings, 'admin_user', 'admin'))
-        correct_password = secrets.compare_digest(credentials.password, getattr(settings, 'admin_password', 'abvhimiya2026'))
-        
-        if not (correct_username and correct_password):
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Невірний логін або пароль",
-                headers={"WWW-Authenticate": "Basic"},
-            )
         return True
 
     @app.get('/')
@@ -278,22 +265,18 @@ def create_app(settings=None):
             raise HTTPException(422, 'Напишіть питання')
         
         lock = turn_locks.setdefault(uid, asyncio.Lock())
-        # Спочатку блокуємо і читаємо історію
         async with lock:
             history = store.history(uid)
         
         clean_msg = redact(message)
         
-        # ВИКЛИКАЄМО ШІ ПОЗА ЛОКОМ (щоб не блокувати наступні запити, поки чекаємо Gemini)
         try:
-            # Захист від таймауту на рівні FastAPI (28 сек, бо на клієнті 30 сек)
             async with asyncio.timeout(28.0):
                 answer = await assistant.answer(clean_msg, history)
         except asyncio.TimeoutError:
             log.warning(f"FastAPI chat endpoint timeout for user {uid}")
             answer = {'reply': 'Запит надто складний, і я не встиг його обробити. Уточніть питання або зверніться до менеджера.', 'products': [], 'handoff': True}
         
-        # Зберігаємо результат, знову беремо лок
         async with lock:
             current_history = store.history(uid)
             store.save_history(uid, current_history + [
@@ -318,7 +301,8 @@ def create_app(settings=None):
             'name': body.name.strip(),
             'phone': body.phone,
             'note': body.note.strip(),
-            'product_id': body.product_id
+            'product_id': body.product_id,
+            'page_url': body.page_url # ДОДАНО
         }
         fingerprint = hashlib.sha256(json.dumps(submitted, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         request_id = str(body.request_id)
@@ -348,8 +332,6 @@ def create_app(settings=None):
             'request_id': request_id,
             'message': 'Заявку збережено! Менеджер зв’яжеться з вами найближчим часом.'
         }
-
-    # --- АДМІН-ПАНЕЛЬ ТА ПЕРЕГЛЯД ДІАЛОГІВ ---
 
     @app.get('/admin/overview', dependencies=[Depends(admin_auth)])
     async def get_overview():
@@ -392,6 +374,7 @@ def create_app(settings=None):
 async def send_telegram(settings, lead_obj):
     data = lead_obj['payload']
     product = data.get('product')
+    page_url = data.get('page_url') # ДОДАНО
     
     lead_id_safe = html.escape(str(lead_obj['id']))
     name_safe = html.escape(data.get('name') or 'Не вказано')
@@ -399,7 +382,6 @@ async def send_telegram(settings, lead_obj):
     
     lines = [
         '⚡ <b>ЗАЯВКА З ЧАТУ ABV ХІМІЯ</b>',
-        f"<b>ID:</b> <code>{lead_id_safe}</code>",
         f"<b>Ім’я:</b> {name_safe}",
         f"<b>Телефон:</b> <code>{phone_safe}</code>"
     ]
@@ -407,6 +389,10 @@ async def send_telegram(settings, lead_obj):
         p_name = html.escape(str(product.get('name', '')))
         p_sku = html.escape(str(product.get('vendor_code', product.get('id', ''))))
         lines.append(f"<b>Товар:</b> {p_name} (Арт: {p_sku})")
+        
+    if page_url:
+        lines.append(f"<b>Сторінка сайту:</b> <a href=\"{html.escape(page_url)}\">Перейти</a>")
+        
     if data.get('note'):
         lines.append(f"<b>Коментар:</b> {html.escape(str(data['note']))}")
     
