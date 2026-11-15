@@ -14,7 +14,7 @@ SYSTEM = '''Ти найкращий продавець-консультант і
 Спілкуйся українською мовою, дуже доброзичливо, як жива людина. Тексти пиши короткі (1-2 абзаци).
 
 ТВОЇ ГОЛОВНІ ЗАВДАННЯ (ПРОДАЖІ ТА КОНСУЛЬТАЦІЯ):
-1. ЗАДАВАЙ ПИТАННЯ: Якщо клієнт пише загально (наприклад "мені потрібна синя фарба" або "шукаю клей"), не видавай суху відповідь. Обов'язково постав 1 уточнююче питання в кінці: "Для якої поверхні вам потрібна фарба (метал, дерево, пластик)?" або "Де будуть проводитись роботи — на вулиці чи в приміщенні?".
+1. ЗАДАВАЙ ПИТАННЯ: Якщо клієнт пише загально (наприклад "мені потрібна синя фарба" або "шукаю клей"), не видавай суху відповідь. Обов'язково постав 1 уточнююче питання в кінці: "Вам потрібна аерозольна фарба, емаль чи гумова? Для якої поверхні (метал, дерево, пластик)?" або "Де будуть проводитись роботи — на вулиці чи в приміщенні?".
 2. РОБИ ДОПРОДАЖІ (Крос-сейл): Якщо клієнт вибрав фарбу чи емаль — завжди м'яко пропонуй додати розчинник (уайт-спірит/нефрас) для знежирення або розведення. Якщо бере епоксидку — нагадай про засоби захисту.
 3. ОПЛАТА ТА РЕКВІЗИТИ: Якщо клієнт запитує реквізити, як оплатити, або питає номер картки, видай цей текст: "Ось реквізити для оплати:\nРахунок (IBAN): UA593052990000026004020124857\nОтримувач: ФОП Черненко Ольга Сергіївна (ЄДРПОУ 3449906025)\nБанк: АТ КБ «ПРИВАТБАНК»\nПризначення платежу: Оплата інтернет-замовлення № [вкажіть номер вашого замовлення].\nПісля оплати, будь ласка, напишіть нам, щоб ми якнайшвидше відправили товар!"
 4. Базуй характеристики товарів ВИКЛЮЧНО на масиві facts. Вказуй id товарів у product_ids. Не пиши ціни в тексті.'''
@@ -24,15 +24,15 @@ EXPERT_KNOWLEDGE = {
     "нефрас_уайт": (
         "Головна відмінність — у швидкості випаровування, залишку та призначенні:\n\n"
         "• **Нефрас (бензин-«калоша»)** — легкий розчинник. Випаровується майже миттєво, не залишає жирних слідів і плівки. "
-        "Ідеальний для знежирення поверхонь перед склеюванням/фарбуванням, промивання електроніки, підшипників та інструментів.\n\n"
+        "Ідеальний для знежирення поверхонь перед склеюванням/фарбуванням, промивання електроніки та інструментів.\n\n"
         "• **Уайт-спірит** — важча фракція (гасова основа). Випаровується значно повільніше, має маслянисту основу й характерний запах. "
-        "Його основне призначення — розведення алкідних емалей, масляних фарб, лаків та очищення пензлів після малярних робіт.\n\n"
+        "Його основне призначення — розведення алкідних емалей, масляних фарб, лаків та очищення пензлів.\n\n"
         "Для знежирення деталей обирайте **нефрас**, а для розведення фарби — **уайт-спірит**."
     ),
     "pla_petg": (
         "Різниця між пластиками для 3D-друку:\n\n"
-        "• **PLA** — найпростіший у друці, екологічний (на основі кукурудзи), не дає усадки, твердий, але крихкий і плавиться вже при 55-60°C. Чудовий для декоративних моделей, сувенірів та прототипів.\n\n"
-        "• **PETG** — міцніший, ударостійкий, стійкий до ультрафіолету, вологи та температури до 75-80°C. Оптимальний для технічних деталей, кронштейнів та речей, що використовуються на вулиці чи під навантаженням."
+        "• **PLA** — найпростіший у друці, екологічний, не дає усадки, твердий, але крихкий і плавиться вже при 55-60°C. Чудовий для декоративних моделей.\n\n"
+        "• **PETG** — міцніший, ударостійкий, стійкий до ультрафіолету, вологи та температури до 75-80°C. Оптимальний для технічних деталей та речей на вулиці."
     )
 }
 
@@ -41,7 +41,6 @@ SALESDRIVE_STATUSES = {
     4: "Відправлено", 5: "Отримано", 6: "Скасовано", 7: "Оплачено"
 }
 
-# Вимикання блокувань безпеки для хімічної продукції
 SAFETY_SETTINGS = [
     {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"},
     {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
@@ -81,7 +80,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.4"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.5"}
 
     if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
         urls_to_try = [
@@ -97,7 +96,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
         ]
 
     try:
-        async with httpx.AsyncClient(timeout=5, follow_redirects=True) as client:
+        async with httpx.AsyncClient(timeout=6, follow_redirects=True) as client:
             for req_url in urls_to_try:
                 res = await client.get(req_url, headers=headers)
                 if res.status_code == 200:
@@ -106,14 +105,24 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     if orders:
                         m = orders[0]
                         ext_id = m.get("externalId") or m.get("id") or query_str
+                        
+                        # 1. Витягуємо базовий статус
                         st = m.get("status") or "В обробці"
                         st_name = st.get("text", "В обробці") if isinstance(st, dict) else str(st)
                         
+                        # 2. Витягуємо статус доставки (якщо є) - щоб побачити "Прибув у відділення"
+                        delivery_st = m.get("deliveryStatus") or m.get("tracking_status") or ""
+                        if isinstance(delivery_st, dict):
+                            delivery_st = delivery_st.get("text", "")
+                        if delivery_st and delivery_st.strip() and delivery_st != st_name:
+                            st_name = f"{st_name} ({delivery_st})"
+                        
+                        # 3. Надійний пошук ТТН (Нова Пошта 2045... або 5900...)
                         ttn = ""
-                        for field_name in ("trackingNumber", "ttn", "deliveryNumber"):
-                            if m.get(field_name):
-                                ttn = str(m[field_name])
-                                break
+                        dump = json.dumps(m, ensure_ascii=False)
+                        ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', dump)
+                        if ttn_match:
+                            ttn = ttn_match.group(1)
 
                         return {
                             "found": True, 
@@ -133,7 +142,7 @@ class Assistant:
         self.cache = {}
         self.http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
-            timeout=httpx.Timeout(connect=3.0, read=8.0, write=3.0, pool=3.0)
+            timeout=httpx.Timeout(connect=3.0, read=12.0, write=3.0, pool=3.0)
         )
 
     async def aclose(self):
@@ -150,17 +159,15 @@ class Assistant:
         try:
             q = str(message or '').casefold().strip()
 
-            # 0. Перевірка кешу сесії
             if q in self.cache:
                 c_reply, c_ids = self.cache[q]
                 c_items = [self.catalog.products[pid] for pid in c_ids if pid in getattr(self.catalog, 'products', {})]
                 return {'reply': c_reply, 'products': [safe_public_product(p) for p in c_items], 'handoff': False}
 
-            # 1. Захист від небезпеки
             if any(w in q for w in ('зміша', 'смеша')) and any(w in q for w in ('хлор', 'відбілювач', 'аміак', 'кислот')):
                 return {'reply': 'Не змішуйте ці засоби: можливе виділення небезпечних токсичних газів!', 'products': [], 'handoff': True}
 
-            # 2. СТАТУС ЗАМОВЛЕННЯ В CRM (SalesDrive)
+            # СТАТУС ЗАМОВЛЕННЯ В CRM (SalesDrive)
             order_patterns = [
                 r'(?:номер\s+)?(?:замовленн\w*|заявк\w*|посилк\w*|чек\w*|№|#)\s*[:№#\s]*([1-9]\d{3,7})\b',
                 r'\b([1-9]\d{3,7})\b'
@@ -188,7 +195,7 @@ class Assistant:
                     search_id
                 )
                 if info.get("found"):
-                    ttn_text = f"\n• ТТН: {info['ttn']}" if info.get('ttn') else ""
+                    ttn_text = f"\n📦 ТТН Нової Пошти: {info['ttn']}" if info.get('ttn') else ""
                     return {
                         'reply': f"Замовлення №{info['order_id']}:\n• Статус: {info['status']}{ttn_text}",
                         'products': [],
@@ -207,7 +214,7 @@ class Assistant:
                     'handoff': False
                 }
 
-            # 3. DIRECT EXPERT FAQ: Миттєва відповідь на поширені порівняння (0.05 сек)
+            # МИТТЄВА БАЗА ЗНАНЬ
             items = []
             try:
                 if hasattr(self.catalog, 'search') and callable(self.catalog.search):
@@ -216,14 +223,12 @@ class Assistant:
                 log.warning(f"Catalog search error: {e}")
 
             if 'нефрас' in q and ('уайт' in q or 'вайт' in q):
-                reply_text = EXPERT_KNOWLEDGE["нефрас_уайт"]
-                return {'reply': reply_text, 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
+                return {'reply': EXPERT_KNOWLEDGE["нефрас_уайт"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
             
             if 'pla' in q and 'petg' in q:
-                reply_text = EXPERT_KNOWLEDGE["pla_petg"]
-                return {'reply': reply_text, 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
+                return {'reply': EXPERT_KNOWLEDGE["pla_petg"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
 
-            # 4. Перевірка артикулів
+            # ПЕРЕВІРКА АРТИКУЛІВ
             if re.search(r'(?:артикул|арт|код|тов|модел)\b', q, re.IGNORECASE) or re.search(r'[a-zA-Zа-яА-Яіїєґ_-]+\d+', q):
                 art_match = re.search(r'([a-zA-Z0-9а-яА-Яіїєґ_-]{3,20})', q)
                 if art_match:
@@ -232,11 +237,19 @@ class Assistant:
                     if found:
                         return {'reply': "Знайшов позицію за артикулом:", 'products': [safe_public_product(p) for p in found[:3]], 'handoff': False}
 
-            # 5. Ввічливі фрази
             if re.fullmatch(r'(?:дякую|спасибі|ок|добре)[!.\s]*', q):
                 return {'reply': 'Будь ласка! Якщо потрібна допомога з вибором матеріалів — звертайтеся.', 'products': [], 'handoff': False}
 
-            # 6. Генерація відповіді через Gemini AI
+            # FAST-PATH ВИКЛЮЧЕННЯ (щоб бот ставив питання про синю фарбу)
+            broad_terms = ('різниця', 'порівн', 'як', 'чому', 'що краще', 'фарба', 'фарбу', 'клей', 'емаль', 'лак')
+            if items and len(q.split()) <= 2 and not any(k in q for k in broad_terms):
+                return {
+                    'reply': 'Ось що знайшов у каталозі за вашим запитом:',
+                    'products': [safe_public_product(p) for p in items[:4]],
+                    'handoff': False
+                }
+
+            # ГЕНЕРАЦІЯ ЧЕРЕЗ ШІ (Gemini)
             if getattr(self.settings, 'gemini_key', None):
                 result = await self.generate(message, history, items)
                 if result:
@@ -253,7 +266,6 @@ class Assistant:
                         'handoff': ai_handoff
                     }
 
-            # 7. Резервна відповідь (якщо ШІ не відповів)
             return {
                 'reply': 'Підібрав відповідні матеріали з каталогу ABV Хімія. Перегляньте варіанти нижче або запитайте в нашого консультанта:',
                 'products': [safe_public_product(p) for p in items[:4]],
@@ -269,7 +281,7 @@ class Assistant:
             {
                 'id': str(getattr(p, 'id', '')).strip(),
                 'name': str(getattr(p, 'name', '')),
-                'description': str(getattr(p, 'description', '') or '')[:120]
+                'description': str(getattr(p, 'description', '') or '')[:150]
             }
             for p in items[:3]
         ]
@@ -315,14 +327,12 @@ class Assistant:
                     data = response.json()
                     candidates = data.get('candidates', [])
                     if not candidates:
-                        log.warning(f"Gemini [{model_name}] returned empty candidates (promptFeedback: {data.get('promptFeedback')})")
                         continue
 
                     candidate = candidates[0]
                     parts = candidate.get('content', {}).get('parts', [])
                     raw_text = ''.join(p.get('text', '') for p in parts).strip()
                     if not raw_text:
-                        log.warning(f"Gemini [{model_name}] returned empty text (finishReason: {candidate.get('finishReason')})")
                         continue
 
                     raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
@@ -333,7 +343,6 @@ class Assistant:
                         ids = [str(x).strip() for x in result.get('product_ids', []) if x]
                         handoff = bool(result.get('handoff', False))
                     except json.JSONDecodeError:
-                        log.warning(f"Model [{model_name}] output non-JSON text. Falling back to raw response.")
                         text_reply = raw_text
                         ids = []
                         handoff = False
@@ -344,7 +353,6 @@ class Assistant:
                         return text_reply, [i for i in ids if i in allowed], handoff
 
             except httpx.TimeoutException:
-                log.warning(f"Gemini timeout on model {model_name}")
                 continue
             except Exception as e:
                 log.warning(f"Error during Gemini call [{model_name}]: {e}")
