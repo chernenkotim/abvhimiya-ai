@@ -17,7 +17,10 @@ SYSTEM = '''Ти найкращий продавець-консультант і
 1. ЗАДАВАЙ ПИТАННЯ: Якщо клієнт пише загально (наприклад "мені потрібна синя фарба" або "шукаю клей"), не видавай суху відповідь. Обов'язково постав 1 уточнююче питання в кінці: "Вам потрібна аерозольна фарба, емаль чи гумова? Для якої поверхні (метал, дерево, пластик)?" або "Де будуть проводитись роботи — на вулиці чи в приміщенні?".
 2. РОБИ ДОПРОДАЖІ (Крос-сейл): Якщо клієнт вибрав фарбу чи емаль — завжди м'яко пропонуй додати розчинник (уайт-спірит/нефрас) для знежирення або розведення. Якщо бере епоксидку — нагадай про засоби захисту.
 3. ОПЛАТА ТА РЕКВІЗИТИ: Якщо клієнт запитує реквізити, як оплатити, або питає номер картки, видай цей текст: "Ось реквізити для оплати:\nРахунок (IBAN): UA593052990000026004020124857\nОтримувач: ФОП Черненко Ольга Сергіївна (ЄДРПОУ 3449906025)\nБанк: АТ КБ «ПРИВАТБАНК»\nПризначення платежу: Оплата інтернет-замовлення № [вкажіть номер вашого замовлення].\nПісля оплати, будь ласка, напишіть нам, щоб ми якнайшвидше відправили товар!"
-4. Базуй характеристики товарів ВИКЛЮЧНО на масиві facts. Вказуй id товарів у product_ids. Не пиши ціни в тексті.'''
+4. Базуй характеристики товарів ВИКЛЮЧНО на масиві facts. Вказуй id товарів у product_ids. Не пиши ціни в тексті.
+
+АБСОЛЮТНО ВАЖЛИВО: Твоя відповідь має бути ТІЛЬКИ у форматі JSON за цим шаблоном:
+{"text": "тут твій текст для клієнта", "product_ids": ["id1", "id2"], "handoff": false}'''
 
 # Миттєва база знань для найчастіших хімічних запитань (відповідь за 0.05 сек без виклику хмари)
 EXPERT_KNOWLEDGE = {
@@ -80,12 +83,14 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.5"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.6"}
 
-    if len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380')):
+    is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
+    
+    if is_order_search:
         urls_to_try = [
-            f"{base_url}?filter[id]={query_str}",
             f"{base_url}?filter[externalId]={query_str}",
+            f"{base_url}?filter[id]={query_str}",
             f"{base_url}?filter[search]={query_str}"
         ]
     else:
@@ -103,7 +108,18 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     data = res.json()
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
-                        m = orders[0]
+                        m = None
+                        # ВИПРАВЛЕННЯ: Сувора перевірка номера замовлення, щоб уникнути помилкових збігів
+                        if is_order_search:
+                            for o in orders:
+                                if query_str in (str(o.get("externalId", "")), str(o.get("id", ""))):
+                                    m = o
+                                    break
+                            if not m:
+                                continue # Якщо знайшли чуже замовлення по сумі чи телефону, йдемо далі
+                        else:
+                            m = orders[0]
+
                         ext_id = m.get("externalId") or m.get("id") or query_str
                         
                         # 1. Витягуємо базовий статус
