@@ -4,11 +4,8 @@
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, maximum-scale=1">
     <title>Консультант — ABV Хімія</title>
-    
-    <!-- Презавантаження критичних ресурсів для миттєвого відображення -->
     <link rel="preload" href="/static/widget.css" as="style">
     <link rel="preload" href="/static/widget.js" as="script">
-    
     <link rel="stylesheet" href="/static/widget.css">
     <script src="/static/widget.js" defer></script>
 </head>
@@ -35,12 +32,7 @@
             <span class="eyebrow">ABV ХІМІЯ</span>
             <p>Вітаю! Допоможу знайти товар, перевірити статус замовлення та розібратися з характеристиками. Що вас цікавить?</p>
         </div>
-        <div class="chips" id="suggestions">
-            <button data-question="Де моє замовлення?">📦 Де моє замовлення?</button>
-            <button data-question="Допоможи підібрати герметик">💧 Підібрати герметик</button>
-            <button data-question="У чому різниця між нефрасом та уайт-спіритом?">🧪 Різниця розчинників</button>
-            <button data-question="Шукаю філамент PLA">🧶 Пластик для 3D</button>
-        </div>
+        <!-- КНОПКИ ПІДКАЗОК ПОВНІСТЮ ВИДАЛЕНО -->
     </section>
     
     <div class="tools">
@@ -50,7 +42,7 @@
     
     <form id="composer" class="composer">
         <label class="sr-only" for="question">Ваше питання</label>
-        <textarea id="question" rows="1" maxlength="2000" placeholder="Напишіть, що шукаєте (або номер заявки)…" required></textarea>
+        <textarea id="question" rows="1" maxlength="2000" placeholder="Напишіть ваше питання..." required></textarea>
         <button id="send" type="submit" aria-label="Надіслати повідомлення" title="Надіслати">
             <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round" style="transform: translateX(1px);">
                 <line x1="22" y1="2" x2="11" y2="13"></line>
@@ -60,12 +52,11 @@
     </form>
     
     <footer>
-        Ціни й наявність — у картках. Технічні поради звіряйте з інструкцією виробника. 
+        Ціни й наявність — у картках. Технічні поради звіряйте з інструкцією. 
         <a id="privacy" href="/privacy" target="_blank" rel="noopener">Конфіденційність</a>
     </footer>
 </main>
 
-<!-- Форма заявки менеджеру -->
 <dialog id="lead-dialog" aria-labelledby="lead-title">
     <form id="lead-form">
         <div class="dialog-heading">
@@ -82,30 +73,26 @@
         <label for="name">Як до вас звертатися <span class="muted">(необов’язково)</span></label>
         <input id="name" maxlength="100" autocomplete="name">
         
-        <!-- inputmode="tel" гарантує цифрову клавіатуру на смартфонах -->
         <label for="phone">Телефон <span style="color:var(--c-danger)">*</span></label>
         <input id="phone" type="tel" inputmode="tel" pattern="[\+0-9\-\s\(\)]+" maxlength="20" autocomplete="tel" placeholder="+380..." required>
         
         <label for="note">Що потрібно уточнити <span class="muted">(необов’язково)</span></label>
-        <textarea id="note" rows="3" maxlength="1000" placeholder="Наприклад: потрібен гуртовий прайс або доставка..."></textarea>
+        <textarea id="note" rows="3" maxlength="1000" placeholder="Наприклад: потрібен гуртовий прайс..."></textarea>
         
         <label class="consent">
             <input id="consent" type="checkbox" required>
-            <span>Погоджуюся на обробку контакту та передавання історії чату менеджеру відповідно до <a id="consent-privacy" href="/privacy" target="_blank" rel="noopener">політики конфіденційності</a>.</span>
+            <span>Погоджуюся на обробку контакту відповідно до <a id="consent-privacy" href="/privacy" target="_blank" rel="noopener">політики конфіденційності</a>.</span>
         </label>
         
         <p id="lead-error" class="error" role="alert"></p>
         <button id="lead-submit" class="primary" type="submit">Надіслати заявку</button>
-        <p class="form-foot">Це звернення напряму до живого менеджера. Купівля та оплата узгоджуються окремо.</p>
     </form>
 </dialog>
 
-<!-- Шаблон індикатора завантаження (вставляється JS-ом) -->
 <template id="tpl-typing">
     <div class="message assistant typing-indicator" aria-label="Бот друкує..." role="status">
         <span></span><span></span><span></span>
     </div>
 </template>
-
 </body>
 </html>
