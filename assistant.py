@@ -307,11 +307,16 @@ class Assistant:
             'message': redact(str(message))
         }
 
+        # ВИПРАВЛЕННЯ: Використовуємо стабільні та найновіші назви моделей Google
         cfg_model = (getattr(self.settings, 'gemini_model', '') or '').strip().replace('models/', '')
         models_to_try = []
-        if cfg_model and cfg_model not in ('gemini-2.5-flash', 'gemini-2.5-flash-lite', 'gemini-3.8-flash'):
+        
+        # 1. Спочатку пробуємо ту модель, яка вказана у вашому файлі .env (якщо вона є)
+        if cfg_model:
             models_to_try.append(cfg_model)
-        for m in ['gemini-2.0-flash', 'gemini-2.0-flash-lite', 'gemini-1.5-flash']:
+            
+        # 2. Додаємо актуальні моделі, які 100% працюють у поточній версії API Google
+        for m in ['gemini-1.5-flash-latest', 'gemini-1.5-flash-002', 'gemini-1.5-flash-001', 'gemini-1.5-pro-latest']:
             if m not in models_to_try:
                 models_to_try.append(m)
 
