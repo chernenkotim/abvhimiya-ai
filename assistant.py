@@ -307,16 +307,15 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # ВИПРАВЛЕННЯ: Використовуємо стабільні та найновіші назви моделей Google
+        # ВИПРАВЛЕННЯ: Використовуємо ТІЛЬКИ базові імена моделей.
+        # Google API відхиляє складні назви (типу -latest) для вашого ключа.
         cfg_model = (getattr(self.settings, 'gemini_model', '') or '').strip().replace('models/', '')
         models_to_try = []
         
-        # 1. Спочатку пробуємо ту модель, яка вказана у вашому файлі .env (якщо вона є)
         if cfg_model:
             models_to_try.append(cfg_model)
             
-        # 2. Додаємо актуальні моделі, які 100% працюють у поточній версії API Google
-        for m in ['gemini-1.5-flash-latest', 'gemini-1.5-flash-002', 'gemini-1.5-flash-001', 'gemini-1.5-pro-latest']:
+        for m in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']:
             if m not in models_to_try:
                 models_to_try.append(m)
 
