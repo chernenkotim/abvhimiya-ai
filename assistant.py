@@ -307,9 +307,9 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip().replace('models/', '')
+        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
         models_to_try = [cfg_model]
-        for fallback_model in ('gemini-2.5-flash', 'gemini-2.5-flash-lite'):
+        for fallback_model in ('gemini-3.8-flash', 'gemini-3.8-flash-lite', 'gemini-3.8-pro'):
             if fallback_model not in models_to_try:
                 models_to_try.append(fallback_model)
 
@@ -324,7 +324,7 @@ class Assistant:
             'safetySettings': SAFETY_SETTINGS
         }
 
-        max_retries = 1
+        max_retries = 4
 
         for model_name in models_to_try:
             for attempt in range(max_retries + 1):
@@ -339,11 +339,12 @@ class Assistant:
                         
                         if response.status_code in (503, 429):
                             if attempt < max_retries:
-                                log.warning(f"Google API overload ({response.status_code}) on {model_name}. Retrying...")
-                                await asyncio.sleep(1.0)
+                                wait_sec = 1.0 * (attempt + 1)
+                                log.warning(f"Google API overload ({response.status_code}) on {model_name}. Retry {attempt + 1}/{max_retries} in {wait_sec}s...")
+                                await asyncio.sleep(wait_sec)
                                 continue
                             else:
-                                log.warning(f"Model {model_name} overloaded, switching to next model...")
+                                log.warning(f"Model {model_name} still overloaded after {max_retries} retries, trying next...")
                                 break
                                 
                         if response.status_code != 200:
