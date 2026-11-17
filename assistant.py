@@ -89,7 +89,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.9"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/4.0"}
 
     is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
     
@@ -113,41 +113,88 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                 if res.status_code == 200:
                     data = res.json()
                     orders = data.get("data", []) or data.get("orders", [])
-                    if orders:
-                        m = None
-                        if is_order_search:
-                            for o in orders:
-                                if query_str in (str(o.get("externalId", "")), str(o.get("id", ""))):
-                                    m = o
-                                    break
-                            if not m:
-                                continue
-                        else:
-                            m = orders[0]
+                    if not orders:
+                        continue
 
-                        ext_id = m.get("externalId") or m.get("id") or query_str
-                        
-                        st = m.get("status") or "В обробці"
-                        st_name = st.get("text", "В обробці") if isinstance(st, dict) else str(st)
-                        
+                    # 1. Будуємо словник статусів з meta-даних CRM (щоб знати точні назви ваших статусів)
+                    status_map = {}
+                    meta = data.get("meta") or {}
+                    fields_meta = meta.get("fields") or {}
+                    status_options = (fields_meta.get("statusId") or {}).get("options") or meta.get("statusId") or []
+                    if isinstance(status_options, list):
+                        for opt in status_options:
+                            if isinstance(opt, dict) and "value" in opt:
+                                status_map[str(opt["value"])] = str(opt.get("text") or opt.get("name") or "")
+                    elif isinstance(status_options, dict):
+                        for k, v in status_options.items():
+                            status_map[str(k)] = v.get("text", str(v)) if isinstance(v, dict) else str(v)
+
+                    m = None
+                    if is_order_search:
+                        for o in orders:
+                            if query_str in (str(o.get("externalId", "")), str(o.get("id", ""))):
+                                m = o
+                                break
+                        if not m:
+                            continue
+                    else:
+                        m = orders[0]
+
+                    ext_id = m.get("externalId") or m.get("id") or query_str
+
+                    # 2. Витягуємо основний статус замовлення (через statusId або status)
+                    st_name = ""
+                    raw_st_id = m.get("statusId")
+                    if raw_st_id is not None:
+                        st_name = status_map.get(str(raw_st_id)) or SALESDRIVE_STATUSES.get(int(raw_st_id), "") if str(raw_st_id).isdigit() else str(raw_st_id)
+                    
+                    if not st_name:
+                        st = m.get("status")
+                        if isinstance(st, dict):
+                            st_name = st.get("text") or st.get("name") or ""
+                        elif isinstance(st, int):
+                            st_name = status_map.get(str(st)) or SALESDRIVE_STATUSES.get(st, "")
+                        elif isinstance(st, str) and st.strip():
+                            st_name = status_map.get(st.strip()) or st.strip()
+
+                    # 3. Шукаємо статус Нової Пошти ("В дорозі", "Прибув у відділення" тощо) у вкладених блоках доставки
+                    np_status = ""
+                    np_blocks = m.get("ord_novaposhta") or m.get("ord_delivery_data") or []
+                    if isinstance(np_blocks, dict):
+                        np_blocks = [np_blocks]
+                    if isinstance(np_blocks, list) and np_blocks:
+                        first_np = np_blocks[0] if isinstance(np_blocks[0], dict) else {}
+                        np_status = (
+                            first_np.get("statusText")
+                            or first_np.get("status")
+                            or first_np.get("trackingStatus")
+                            or first_np.get("stateName")
+                            or ""
+                        )
+                        if isinstance(np_status, dict):
+                            np_status = np_status.get("text", "")
+
+                    if not np_status:
                         delivery_st = m.get("deliveryStatus") or m.get("tracking_status") or ""
-                        if isinstance(delivery_st, dict):
-                            delivery_st = delivery_st.get("text", "")
-                        if delivery_st and delivery_st.strip() and delivery_st != st_name:
-                            st_name = f"{st_name} ({delivery_st})"
-                        
-                        ttn = ""
-                        dump = json.dumps(m, ensure_ascii=False)
-                        ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', dump)
-                        if ttn_match:
-                            ttn = ttn_match.group(1)
+                        np_status = delivery_st.get("text", "") if isinstance(delivery_st, dict) else str(delivery_st)
 
-                        return {
-                            "found": True, 
-                            "order_id": ext_id, 
-                            "status": st_name, 
-                            "ttn": ttn
-                        }
+                    # Якщо статусу замовлення немає, але є ТТН — ставимо "Відправлено" замість "В обробці"
+                    dump = json.dumps(m, ensure_ascii=False)
+                    ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', dump)
+                    ttn = ttn_match.group(1) if ttn_match else ""
+
+                    if not st_name:
+                        st_name = "Відправлено" if ttn else "В обробці"
+
+                    if np_status and str(np_status).strip() and str(np_status).strip().lower() not in st_name.lower():
+                        st_name = f"{st_name} — НП: {str(np_status).strip()}"
+
+                    return {
+                        "found": True, 
+                        "order_id": ext_id, 
+                        "status": st_name, 
+                        "ttn": ttn
+                    }
     except Exception as e:
         log.warning(f"SalesDrive lookup error: {e}")
 
