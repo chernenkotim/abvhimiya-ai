@@ -307,16 +307,9 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # Оновлений список моделей: додано gemini-1.5-flash-latest як пріоритетну
-        cfg_model = (getattr(self.settings, 'gemini_model', '') or '').strip().replace('models/', '')
-        models_to_try = []
-        
-        if cfg_model:
-            models_to_try.append(cfg_model)
-            
-        for m in ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']:
-            if m not in models_to_try:
-                models_to_try.append(m)
+        # Беремо вашу основну модель з налаштувань (або використовуємо сучасну як резерв)
+        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
+        models_to_try = [cfg_model]
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
@@ -329,52 +322,67 @@ class Assistant:
             'safetySettings': SAFETY_SETTINGS
         }
 
+        max_retries = 2  # Дозволяємо 2 повторні спроби, якщо Google перевантажений
+
         for model_name in models_to_try:
-            try:
-                async with self.semaphore:
-                    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent'
-                    response = await self.http_client.post(
-                        url,
-                        headers={'x-goog-api-key': self.settings.gemini_key},
-                        json=body
-                    )
-                    
-                    if response.status_code != 200:
-                        log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
+            for attempt in range(max_retries + 1):
+                try:
+                    async with self.semaphore:
+                        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent'
+                        response = await self.http_client.post(
+                            url,
+                            headers={'x-goog-api-key': self.settings.gemini_key},
+                            json=body
+                        )
+                        
+                        # Якщо сервери Google перевантажені (503 або 429) — чекаємо 1-2 секунди і пробуємо знову
+                        if response.status_code in (503, 429):
+                            if attempt < max_retries:
+                                log.warning(f"Google API overload ({response.status_code}) on {model_name}. Retrying...")
+                                await asyncio.sleep(1.0 + attempt)
+                                continue
+                            else:
+                                break # Якщо всі спроби вичерпано
+                                
+                        # Якщо модель не знайдена (404) або інша помилка — одразу перериваємо
+                        if response.status_code != 200:
+                            log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
+                            break 
+
+                        data = response.json()
+                        candidates = data.get('candidates', [])
+                        if not candidates:
+                            break
+
+                        candidate = candidates[0]
+                        parts = candidate.get('content', {}).get('parts', [])
+                        raw_text = ''.join(p.get('text', '') for p in parts).strip()
+                        if not raw_text:
+                            break
+
+                        raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
+                        
+                        try:
+                            result = json.loads(raw_text, strict=False)
+                            text_reply = str(result.get('text', '')).strip()
+                            ids = [str(x).strip() for x in result.get('product_ids', []) if x]
+                            handoff = bool(result.get('handoff', False))
+                        except json.JSONDecodeError:
+                            text_reply = raw_text
+                            ids = []
+                            handoff = False
+
+                        allowed = {str(getattr(p, 'id', '')).strip() for p in items}
+
+                        if text_reply:
+                            return text_reply, [i for i in ids if i in allowed], handoff
+
+                except httpx.TimeoutException:
+                    if attempt < max_retries:
                         continue
-
-                    data = response.json()
-                    candidates = data.get('candidates', [])
-                    if not candidates:
-                        continue
-
-                    candidate = candidates[0]
-                    parts = candidate.get('content', {}).get('parts', [])
-                    raw_text = ''.join(p.get('text', '') for p in parts).strip()
-                    if not raw_text:
-                        continue
-
-                    raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
-                    
-                    try:
-                        result = json.loads(raw_text, strict=False)
-                        text_reply = str(result.get('text', '')).strip()
-                        ids = [str(x).strip() for x in result.get('product_ids', []) if x]
-                        handoff = bool(result.get('handoff', False))
-                    except json.JSONDecodeError:
-                        text_reply = raw_text
-                        ids = []
-                        handoff = False
-
-                    allowed = {str(getattr(p, 'id', '')).strip() for p in items}
-
-                    if text_reply:
-                        return text_reply, [i for i in ids if i in allowed], handoff
-
-            except httpx.TimeoutException:
-                continue
-            except Exception as e:
-                log.warning(f"Error during Gemini call [{model_name}]: {e}")
-                continue
+                    break
+                except Exception as e:
+                    log.warning(f"Error during Gemini call [{model_name}]: {e}")
+                    break
 
         return None
