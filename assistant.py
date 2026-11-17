@@ -23,7 +23,6 @@ SYSTEM = '''Ти найкращий продавець-консультант і
 АБСОЛЮТНО ВАЖЛИВО: Твоя відповідь має бути ТІЛЬКИ у форматі JSON за цим шаблоном:
 {"text": "тут твій текст для клієнта", "product_ids": ["id1", "id2"], "handoff": false}'''
 
-# Миттєва база знань для найчастіших хімічних запитань (відповідь за 0.05 сек без виклику хмари)
 EXPERT_KNOWLEDGE = {
     "нефрас_уайт": (
         "Головна відмінність — у швидкості випаровування, залишку та призначенні:\n\n"
@@ -84,7 +83,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.7"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.8"}
 
     is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
     
@@ -153,10 +152,10 @@ class Assistant:
         self.settings, self.store, self.catalog = settings, store, catalog
         self.semaphore = asyncio.Semaphore(15)
         self.cache = {}
-        # Зменшили read timeout до 6 сек, щоб завислі запити Google не блокували весь чат
+        # Збільшили read до 14 сек, щоб модель встигала відповісти навіть під навантаженням
         self.http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
-            timeout=httpx.Timeout(connect=3.0, read=6.0, write=3.0, pool=3.0)
+            timeout=httpx.Timeout(connect=3.0, read=14.0, write=3.0, pool=3.0)
         )
 
     async def aclose(self):
@@ -305,11 +304,7 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
-        models_to_try = [cfg_model]
-        for fallback_model in ('gemini-3.8-flash-lite', 'gemini-3.8-flash', 'gemini-3.8-pro'):
-            if fallback_model not in models_to_try:
-                models_to_try.append(fallback_model)
+        model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
@@ -317,72 +312,72 @@ class Assistant:
             'generationConfig': {
                 'temperature': 0.2,
                 'maxOutputTokens': 350,
-                'responseMimeType': 'application/json'
+                'responseMimeType': 'application/json',
+                # Вимикаємо довгі "роздуми" моделі, щоб відповідь прилітала за 1-2 секунди
+                'thinkingConfig': {'thinkingBudget': 0}
             },
             'safetySettings': SAFETY_SETTINGS
         }
 
-        deadline = time.monotonic() + 18.0  # Жорсткий ліміт 18 сек, щоб не дійти до тайм-ауту FastAPI (28 сек)
+        deadline = time.monotonic() + 24.0
 
-        for model_name in models_to_try:
-            for attempt in range(2):  # Максимум 2 швидкі спроби на модель, далі перемикаємося на легшу
-                if time.monotonic() > deadline:
-                    log.warning("Gemini generation reached 18s internal deadline.")
-                    return None
+        for attempt in range(3):
+            if time.monotonic() > deadline:
+                break
 
-                try:
-                    async with self.semaphore:
-                        url = f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent'
-                        response = await self.http_client.post(
-                            url,
-                            headers={'x-goog-api-key': self.settings.gemini_key},
-                            json=body
-                        )
-                        
-                        if response.status_code in (503, 429):
-                            log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}).")
-                            if attempt == 0 and time.monotonic() + 1.0 < deadline:
-                                await asyncio.sleep(0.7)
-                                continue
-                            break  # Перемикаємося на наступну модель (lite)
-                                
-                        if response.status_code != 200:
-                            log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
-                            break 
+            try:
+                async with self.semaphore:
+                    url = f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent'
+                    response = await self.http_client.post(
+                        url,
+                        headers={'x-goog-api-key': self.settings.gemini_key},
+                        json=body
+                    )
+                    
+                    if response.status_code in (503, 429):
+                        log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}/3).")
+                        if attempt < 2 and time.monotonic() + 1.5 < deadline:
+                            await asyncio.sleep(1.0)
+                            continue
+                        break
+                            
+                    if response.status_code != 200:
+                        log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
+                        break 
 
-                        data = response.json()
-                        candidates = data.get('candidates', [])
-                        if not candidates:
-                            break
+                    data = response.json()
+                    candidates = data.get('candidates', [])
+                    if not candidates:
+                        break
 
-                        candidate = candidates[0]
-                        parts = candidate.get('content', {}).get('parts', [])
-                        raw_text = ''.join(p.get('text', '') for p in parts).strip()
-                        if not raw_text:
-                            break
+                    candidate = candidates[0]
+                    parts = candidate.get('content', {}).get('parts', [])
+                    raw_text = ''.join(p.get('text', '') for p in parts).strip()
+                    if not raw_text:
+                        break
 
-                        raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
-                        
-                        try:
-                            result = json.loads(raw_text, strict=False)
-                            text_reply = str(result.get('text', '')).strip()
-                            ids = [str(x).strip() for x in result.get('product_ids', []) if x]
-                            handoff = bool(result.get('handoff', False))
-                        except json.JSONDecodeError:
-                            text_reply = raw_text
-                            ids = []
-                            handoff = False
+                    raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
+                    
+                    try:
+                        result = json.loads(raw_text, strict=False)
+                        text_reply = str(result.get('text', '')).strip()
+                        ids = [str(x).strip() for x in result.get('product_ids', []) if x]
+                        handoff = bool(result.get('handoff', False))
+                    except json.JSONDecodeError:
+                        text_reply = raw_text
+                        ids = []
+                        handoff = False
 
-                        allowed = {str(getattr(p, 'id', '')).strip() for p in items}
+                    allowed = {str(getattr(p, 'id', '')).strip() for p in items}
 
-                        if text_reply:
-                            return text_reply, [i for i in ids if i in allowed], handoff
+                    if text_reply:
+                        return text_reply, [i for i in ids if i in allowed], handoff
 
-                except httpx.TimeoutException:
-                    log.warning(f"Gemini timeout (6s) on {model_name} (attempt {attempt + 1}), switching...")
-                    break  # Якщо зависла — одразу йдемо на lite-модель, не чекаємо вдруге
-                except Exception as e:
-                    log.warning(f"Error during Gemini call [{model_name}]: {e}")
-                    break
+            except httpx.TimeoutException:
+                log.warning(f"Gemini timeout on {model_name} (attempt {attempt + 1}/3), retrying...")
+                continue
+            except Exception as e:
+                log.warning(f"Error during Gemini call [{model_name}]: {e}")
+                break
 
         return None
