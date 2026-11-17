@@ -20,7 +20,7 @@ SYSTEM = '''Ти найкращий продавець-консультант і
 3. ОПЛАТА ТА РЕКВІЗИТИ: Якщо клієнт запитує реквізити, як оплатити, або питає номер картки, видай цей текст: "Ось реквізити для оплати:\nРахунок (IBAN): UA593052990000026004020124857\nОтримувач: ФОП Черненко Ольга Сергіївна (ЄДРПОУ 3449906025)\nБанк: АТ КБ «ПРИВАТБАНК»\nПризначення платежу: Оплата інтернет-замовлення № [вкажіть номер вашого замовлення].\nПісля оплати, будь ласка, напишіть нам, щоб ми якнайшвидше відправили товар!"
 4. Базуй характеристики товарів ВИКЛЮЧНО на масиві facts. Вказуй id товарів у product_ids. Не пиши ціни в тексті.
 
-АБСОЛЮТНО ВАЖЛИВО: Твоя відповідь має бути ТІЛЬКИ у форматі JSON за цим шаблоном:
+АБСОЛЮТНО ВАЖЛИВО: Твоя відповідь має бути ТІЛЬКИ валідним JSON без зайвого тексту навколо:
 {"text": "тут твій текст для клієнта", "product_ids": ["id1", "id2"], "handoff": false}'''
 
 EXPERT_KNOWLEDGE = {
@@ -36,6 +36,12 @@ EXPERT_KNOWLEDGE = {
         "Різниця між пластиками для 3D-друку:\n\n"
         "• **PLA** — найпростіший у друці, екологічний, не дає усадки, твердий, але крихкий і плавиться вже при 55-60°C. Чудовий для декоративних моделей.\n\n"
         "• **PETG** — міцніший, ударостійкий, стійкий до ультрафіолету, вологи та температури до 75-80°C. Оптимальний для технічних деталей та речей на вулиці."
+    ),
+    "знежирення_ванни": (
+        "Для знежирення поверхні ванни перед реставрацією або фарбуванням найкраще підходить **нефрас (бензин-«калоша»)** або **ізопропіловий спирт** — вони швидко випаровуються і не залишають жирної плівки.\n\n"
+        "• Для **чавунної або сталевої емальованої ванни** також можна використати **ацетон** або **розчинник 646**.\n"
+        "• Для **акрилової ванни** агресивні розчинники (ацетон, 646) використовувати не можна — підійде тільки м'яке знежирення ізопропіловим спиртом або мийним засобом.\n\n"
+        "Підкажіть, у вас чавунна, сталева чи акрилова ванна, і якою фарбою/емаллю плануєте покривати?"
     )
 }
 
@@ -83,7 +89,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.8"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.9"}
 
     is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
     
@@ -152,10 +158,9 @@ class Assistant:
         self.settings, self.store, self.catalog = settings, store, catalog
         self.semaphore = asyncio.Semaphore(15)
         self.cache = {}
-        # Збільшили read до 14 сек, щоб модель встигала відповісти навіть під навантаженням
         self.http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
-            timeout=httpx.Timeout(connect=3.0, read=14.0, write=3.0, pool=3.0)
+            timeout=httpx.Timeout(connect=3.0, read=12.0, write=3.0, pool=3.0)
         )
 
     async def aclose(self):
@@ -241,6 +246,9 @@ class Assistant:
             if 'pla' in q and 'petg' in q:
                 return {'reply': EXPERT_KNOWLEDGE["pla_petg"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
 
+            if ('обезжир' in q or 'знежир' in q) and 'ванн' in q:
+                return {'reply': EXPERT_KNOWLEDGE["знежирення_ванни"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
+
             # ПЕРЕВІРКА АРТИКУЛІВ
             if re.search(r'(?:артикул|арт|код|тов|модел)\b', q, re.IGNORECASE) or re.search(r'[a-zA-Zа-яА-Яіїєґ_-]+\d+', q):
                 art_match = re.search(r'([a-zA-Z0-9а-яА-Яіїєґ_-]{3,20})', q)
@@ -306,22 +314,21 @@ class Assistant:
 
         model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
 
+        # ПРИБРАНО responseMimeType: 'application/json' — саме цей параметр викликав зависання запитів на стороні Google
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}],
             'generationConfig': {
                 'temperature': 0.2,
                 'maxOutputTokens': 350,
-                'responseMimeType': 'application/json',
-                # Вимикаємо довгі "роздуми" моделі, щоб відповідь прилітала за 1-2 секунди
                 'thinkingConfig': {'thinkingBudget': 0}
             },
             'safetySettings': SAFETY_SETTINGS
         }
 
-        deadline = time.monotonic() + 24.0
+        deadline = time.monotonic() + 22.0
 
-        for attempt in range(3):
+        for attempt in range(2):
             if time.monotonic() > deadline:
                 break
 
@@ -335,8 +342,8 @@ class Assistant:
                     )
                     
                     if response.status_code in (503, 429):
-                        log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}/3).")
-                        if attempt < 2 and time.monotonic() + 1.5 < deadline:
+                        log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}/2).")
+                        if attempt == 0 and time.monotonic() + 1.5 < deadline:
                             await asyncio.sleep(1.0)
                             continue
                         break
@@ -374,7 +381,7 @@ class Assistant:
                         return text_reply, [i for i in ids if i in allowed], handoff
 
             except httpx.TimeoutException:
-                log.warning(f"Gemini timeout on {model_name} (attempt {attempt + 1}/3), retrying...")
+                log.warning(f"Gemini timeout on {model_name} (attempt {attempt + 1}/2), retrying...")
                 continue
             except Exception as e:
                 log.warning(f"Error during Gemini call [{model_name}]: {e}")
