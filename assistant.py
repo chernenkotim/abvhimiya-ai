@@ -307,9 +307,11 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # Беремо вашу основну модель з налаштувань (або використовуємо сучасну як резерв)
-        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
+        cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-2.5-flash').strip().replace('models/', '')
         models_to_try = [cfg_model]
+        for fallback_model in ('gemini-2.5-flash', 'gemini-2.5-flash-lite'):
+            if fallback_model not in models_to_try:
+                models_to_try.append(fallback_model)
 
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
@@ -322,7 +324,7 @@ class Assistant:
             'safetySettings': SAFETY_SETTINGS
         }
 
-        max_retries = 2  # Дозволяємо 2 повторні спроби, якщо Google перевантажений
+        max_retries = 1
 
         for model_name in models_to_try:
             for attempt in range(max_retries + 1):
@@ -335,16 +337,15 @@ class Assistant:
                             json=body
                         )
                         
-                        # Якщо сервери Google перевантажені (503 або 429) — чекаємо 1-2 секунди і пробуємо знову
                         if response.status_code in (503, 429):
                             if attempt < max_retries:
                                 log.warning(f"Google API overload ({response.status_code}) on {model_name}. Retrying...")
-                                await asyncio.sleep(1.0 + attempt)
+                                await asyncio.sleep(1.0)
                                 continue
                             else:
-                                break # Якщо всі спроби вичерпано
+                                log.warning(f"Model {model_name} overloaded, switching to next model...")
+                                break
                                 
-                        # Якщо модель не знайдена (404) або інша помилка — одразу перериваємо
                         if response.status_code != 200:
                             log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
                             break 
