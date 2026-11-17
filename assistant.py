@@ -3,6 +3,7 @@ import asyncio
 import json
 import logging
 import re
+import time
 import httpx
 
 from catalog import tokens
@@ -83,7 +84,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.6"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/3.7"}
 
     is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
     
@@ -109,31 +110,27 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     orders = data.get("data", []) or data.get("orders", [])
                     if orders:
                         m = None
-                        # ВИПРАВЛЕННЯ: Сувора перевірка номера замовлення, щоб уникнути помилкових збігів
                         if is_order_search:
                             for o in orders:
                                 if query_str in (str(o.get("externalId", "")), str(o.get("id", ""))):
                                     m = o
                                     break
                             if not m:
-                                continue # Якщо знайшли чуже замовлення по сумі чи телефону, йдемо далі
+                                continue
                         else:
                             m = orders[0]
 
                         ext_id = m.get("externalId") or m.get("id") or query_str
                         
-                        # 1. Витягуємо базовий статус
                         st = m.get("status") or "В обробці"
                         st_name = st.get("text", "В обробці") if isinstance(st, dict) else str(st)
                         
-                        # 2. Витягуємо статус доставки (якщо є) - щоб побачити "Прибув у відділення"
                         delivery_st = m.get("deliveryStatus") or m.get("tracking_status") or ""
                         if isinstance(delivery_st, dict):
                             delivery_st = delivery_st.get("text", "")
                         if delivery_st and delivery_st.strip() and delivery_st != st_name:
                             st_name = f"{st_name} ({delivery_st})"
                         
-                        # 3. Надійний пошук ТТН (Нова Пошта 2045... або 5900...)
                         ttn = ""
                         dump = json.dumps(m, ensure_ascii=False)
                         ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', dump)
@@ -156,9 +153,10 @@ class Assistant:
         self.settings, self.store, self.catalog = settings, store, catalog
         self.semaphore = asyncio.Semaphore(15)
         self.cache = {}
+        # Зменшили read timeout до 6 сек, щоб завислі запити Google не блокували весь чат
         self.http_client = httpx.AsyncClient(
             limits=httpx.Limits(max_keepalive_connections=20, max_connections=40),
-            timeout=httpx.Timeout(connect=3.0, read=12.0, write=3.0, pool=3.0)
+            timeout=httpx.Timeout(connect=3.0, read=6.0, write=3.0, pool=3.0)
         )
 
     async def aclose(self):
@@ -256,8 +254,8 @@ class Assistant:
             if re.fullmatch(r'(?:дякую|спасибі|ок|добре)[!.\s]*', q):
                 return {'reply': 'Будь ласка! Якщо потрібна допомога з вибором матеріалів — звертайтеся.', 'products': [], 'handoff': False}
 
-            # FAST-PATH ВИКЛЮЧЕННЯ (щоб бот ставив питання про синю фарбу)
-            broad_terms = ('різниця', 'порівн', 'як', 'чому', 'що краще', 'фарба', 'фарбу', 'клей', 'емаль', 'лак')
+            # FAST-PATH ВИКЛЮЧЕННЯ
+            broad_terms = ('різниця', 'порівн', 'як', 'чому', 'що краще', 'фарба', 'фарбу', 'клей', 'емаль', 'лак', 'обезжир', 'знежир')
             if items and len(q.split()) <= 2 and not any(k in q for k in broad_terms):
                 return {
                     'reply': 'Ось що знайшов у каталозі за вашим запитом:',
@@ -309,7 +307,7 @@ class Assistant:
 
         cfg_model = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
         models_to_try = [cfg_model]
-        for fallback_model in ('gemini-3.8-flash', 'gemini-3.8-flash-lite', 'gemini-3.8-pro'):
+        for fallback_model in ('gemini-3.8-flash-lite', 'gemini-3.8-flash', 'gemini-3.8-pro'):
             if fallback_model not in models_to_try:
                 models_to_try.append(fallback_model)
 
@@ -324,10 +322,14 @@ class Assistant:
             'safetySettings': SAFETY_SETTINGS
         }
 
-        max_retries = 4
+        deadline = time.monotonic() + 18.0  # Жорсткий ліміт 18 сек, щоб не дійти до тайм-ауту FastAPI (28 сек)
 
         for model_name in models_to_try:
-            for attempt in range(max_retries + 1):
+            for attempt in range(2):  # Максимум 2 швидкі спроби на модель, далі перемикаємося на легшу
+                if time.monotonic() > deadline:
+                    log.warning("Gemini generation reached 18s internal deadline.")
+                    return None
+
                 try:
                     async with self.semaphore:
                         url = f'https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent'
@@ -338,14 +340,11 @@ class Assistant:
                         )
                         
                         if response.status_code in (503, 429):
-                            if attempt < max_retries:
-                                wait_sec = 1.0 * (attempt + 1)
-                                log.warning(f"Google API overload ({response.status_code}) on {model_name}. Retry {attempt + 1}/{max_retries} in {wait_sec}s...")
-                                await asyncio.sleep(wait_sec)
+                            log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}).")
+                            if attempt == 0 and time.monotonic() + 1.0 < deadline:
+                                await asyncio.sleep(0.7)
                                 continue
-                            else:
-                                log.warning(f"Model {model_name} still overloaded after {max_retries} retries, trying next...")
-                                break
+                            break  # Перемикаємося на наступну модель (lite)
                                 
                         if response.status_code != 200:
                             log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
@@ -380,9 +379,8 @@ class Assistant:
                             return text_reply, [i for i in ids if i in allowed], handoff
 
                 except httpx.TimeoutException:
-                    if attempt < max_retries:
-                        continue
-                    break
+                    log.warning(f"Gemini timeout (6s) on {model_name} (attempt {attempt + 1}), switching...")
+                    break  # Якщо зависла — одразу йдемо на lite-модель, не чекаємо вдруге
                 except Exception as e:
                     log.warning(f"Error during Gemini call [{model_name}]: {e}")
                     break
