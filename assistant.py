@@ -307,15 +307,14 @@ class Assistant:
             'message': redact(str(message))
         }
 
-        # ВИПРАВЛЕННЯ: Використовуємо ТІЛЬКИ базові імена моделей.
-        # Google API відхиляє складні назви (типу -latest) для вашого ключа.
+        # Оновлений список моделей: додано gemini-1.5-flash-latest як пріоритетну
         cfg_model = (getattr(self.settings, 'gemini_model', '') or '').strip().replace('models/', '')
         models_to_try = []
         
         if cfg_model:
             models_to_try.append(cfg_model)
             
-        for m in ['gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']:
+        for m in ['gemini-1.5-flash-latest', 'gemini-1.5-flash', 'gemini-1.5-pro', 'gemini-1.0-pro']:
             if m not in models_to_try:
                 models_to_try.append(m)
 
