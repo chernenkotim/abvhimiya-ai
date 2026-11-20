@@ -30,11 +30,14 @@ logging.getLogger('httpx').setLevel(logging.WARNING)
 logging.getLogger('httpcore').setLevel(logging.WARNING)
 log = logging.getLogger('abv')
 
+
 class SessionRequest(BaseModel):
     session_id: str = Field(min_length=40, max_length=160)
 
+
 class ChatRequest(SessionRequest):
     message: str = Field(min_length=1, max_length=2000)
+
 
 class LeadRequest(SessionRequest):
     request_id: UUID
@@ -42,19 +45,21 @@ class LeadRequest(SessionRequest):
     phone: str = Field(max_length=32)
     note: str = Field(default='', max_length=1000)
     product_id: str | None = Field(default=None, max_length=120)
-    page_url: str | None = Field(default=None, max_length=2000) # ДОДАНО: сторінка сайту
+    page_url: str | None = Field(default=None, max_length=2000)
     consent: bool = False
 
     @field_validator('phone')
     @classmethod
-    def phone_valid(cls, value): 
+    def phone_valid(cls, value):
         return normalize_phone(value)
+
 
 class LeadState(BaseModel):
     state: str = Field(pattern=r'^(new|in_progress|done)$')
 
+
 class BodyLimit:
-    def __init__(self, app): 
+    def __init__(self, app):
         self.app = app
 
     async def __call__(self, scope, receive, send):
@@ -63,21 +68,24 @@ class BodyLimit:
         body = bytearray()
         while True:
             message = await receive()
-            if message['type'] == 'http.disconnect': 
+            if message['type'] == 'http.disconnect':
                 return
             body.extend(message.get('body', b''))
             if len(body) > 65536:
                 return await JSONResponse({'detail': 'Запит завеликий'}, status_code=413)(scope, receive, send)
-            if not message.get('more_body', False): 
+            if not message.get('more_body', False):
                 break
         delivered = False
+
         async def replay():
             nonlocal delivered
             if not delivered:
                 delivered = True
                 return {'type': 'http.request', 'body': bytes(body), 'more_body': False}
             return await receive()
+
         await self.app(scope, replay, send)
+
 
 def create_app(settings=None):
     settings = (settings or Settings.from_env()).validate()
@@ -96,13 +104,13 @@ def create_app(settings=None):
                 if settings.telegram_token and settings.telegram_chat and not settings.demo:
                     for _ in range(10):
                         lead_item = store.claim_notification()
-                        if not lead_item: 
+                        if not lead_item:
                             break
                         ok, error = await send_telegram(settings, lead_item)
                         store.finish_notification(lead_item, ok, error)
-            except asyncio.CancelledError: 
+            except asyncio.CancelledError:
                 raise
-            except Exception as e: 
+            except Exception as e:
                 log.error(f'Notification worker failed: {e}; requests remain in database')
             await asyncio.sleep(5)
 
@@ -116,10 +124,10 @@ def create_app(settings=None):
         catalog.restore()
         await catalog.refresh()
         tasks = [asyncio.create_task(job()) for job in (catalog_loop, delivery_loop, cleanup_loop)]
-        try: 
+        try:
             yield
         finally:
-            for task in tasks: 
+            for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
             if hasattr(assistant, 'aclose'):
@@ -134,7 +142,7 @@ def create_app(settings=None):
         redoc_url=None
     )
     app.state.settings, app.state.store, app.state.catalog, app.state.assistant = settings, store, catalog, assistant
-    
+
     origins = list(dict.fromkeys((settings.public_origin, *settings.parent_origins)))
     app.add_middleware(BodyLimit)
     app.add_middleware(
@@ -159,9 +167,9 @@ def create_app(settings=None):
             'Referrer-Policy': 'no-referrer',
             'Permissions-Policy': 'camera=(), microphone=(), geolocation=()'
         })
-        if not widget: 
+        if not widget:
             response.headers['X-Frame-Options'] = 'DENY'
-        if request.url.path.startswith(('/api', '/admin')) or widget: 
+        if request.url.path.startswith(('/api', '/admin')) or widget:
             response.headers['Cache-Control'] = 'no-store'
         return response
 
@@ -175,7 +183,7 @@ def create_app(settings=None):
         ]
         if session_val:
             rules.append(('session:' + kind + ':' + session_val, {'chat': 40, 'lead': 10}.get(kind, 35), 60))
-        if not store.allow(rules): 
+        if not store.allow(rules):
             raise HTTPException(429, 'Забагато запитів. Спробуйте за хвилину.', headers={'Retry-After': '60'})
 
     def mint_session():
@@ -189,35 +197,34 @@ def create_app(settings=None):
         try:
             uid, expiry, signature = token.split('.')
             expected = hmac.new(settings.secret.encode(), f'{uid}.{expiry}'.encode(), 'sha256').hexdigest()
-            if len(uid) != 32 or not hmac.compare_digest(signature, expected): 
+            if len(uid) != 32 or not hmac.compare_digest(signature, expected):
                 raise ValueError
-            if int(expiry) < time.time(): 
+            if int(expiry) < time.time():
                 raise ValueError
             return uid
-        except (ValueError, TypeError): 
+        except (ValueError, TypeError):
             raise HTTPException(403, 'Сесія недійсна або завершилася', headers={'X-Session-Expired': '1'})
 
-    # ДОДАНО: Заглушка авторизації, щоб пускати без пароля
     async def admin_auth(request: Request):
         limit(request, 'admin')
         return True
 
     @app.get('/')
     @app.get('/widget')
-    async def widget_page(): 
+    async def widget_page():
         return FileResponse(BASE / 'static' / 'widget.html')
 
     @app.get('/admin')
-    async def admin_view(auth_passed: bool = Depends(admin_auth)): 
+    async def admin_view(auth_passed: bool = Depends(admin_auth)):
         return FileResponse(BASE / 'static' / 'admin.html')
 
     @app.get('/privacy')
-    async def privacy_view(): 
+    async def privacy_view():
         return FileResponse(BASE / 'static' / 'privacy.html')
 
     @app.get('/health')
     @app.get('/health/live')
-    async def health_live(): 
+    async def health_live():
         return {'status': 'ok', 'catalog_ready': catalog.fresh, 'catalog_count': len(catalog.products)}
 
     @app.get('/api/config')
@@ -252,7 +259,7 @@ def create_app(settings=None):
         uid = validate(body.session_id)
         limit(request, 'history', uid)
         lock = turn_locks.setdefault(uid, asyncio.Lock())
-        async with lock: 
+        async with lock:
             store.delete_history(uid)
         return {'status': 'cleared'}
 
@@ -261,22 +268,22 @@ def create_app(settings=None):
         uid = validate(body.session_id)
         limit(request, 'chat', uid)
         message = body.message.strip()
-        if not message: 
+        if not message:
             raise HTTPException(422, 'Напишіть питання')
-        
+
         lock = turn_locks.setdefault(uid, asyncio.Lock())
         async with lock:
             history = store.history(uid)
-        
+
         clean_msg = redact(message)
-        
+
         try:
             async with asyncio.timeout(28.0):
-                answer = await assistant.answer(clean_msg, history)
+                answer = await assistant.answer(clean_msg, history, raw_message=message, session_uid=uid)
         except asyncio.TimeoutError:
             log.warning(f"FastAPI chat endpoint timeout for user {uid}")
             answer = {'reply': 'Запит надто складний, і я не встиг його обробити. Уточніть питання або зверніться до менеджера.', 'products': [], 'handoff': True}
-        
+
         async with lock:
             current_history = store.history(uid)
             store.save_history(uid, current_history + [
@@ -294,28 +301,28 @@ def create_app(settings=None):
     async def create_lead(body: LeadRequest, request: Request):
         uid = validate(body.session_id)
         limit(request, 'lead', uid)
-        if not body.consent: 
+        if not body.consent:
             raise HTTPException(422, 'Підтвердьте згоду на обробку контакту для заявки')
-        
+
         submitted = {
             'name': body.name.strip(),
             'phone': body.phone,
             'note': body.note.strip(),
             'product_id': body.product_id,
-            'page_url': body.page_url # ДОДАНО
+            'page_url': body.page_url
         }
         fingerprint = hashlib.sha256(json.dumps(submitted, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
         request_id = str(body.request_id)
-        
+
         try:
             if not store.existing(request_id, uid, fingerprint):
                 product = None
                 if body.product_id:
                     item = catalog.products.get(body.product_id)
-                    if not item: 
+                    if not item:
                         raise HTTPException(404, 'Товар не знайдено. Залиште загальну заявку менеджеру.')
                     product = item.public() if catalog.fresh else {'id': item.id, 'name': item.name, 'price': None, 'available': None}
-                
+
                 payload = submitted | {
                     'product': product,
                     'context': store.history(uid)[-8:],
@@ -324,7 +331,7 @@ def create_app(settings=None):
                     'demo': settings.demo
                 }
                 store.create_lead(request_id, uid, fingerprint, payload)
-        except Conflict: 
+        except Conflict:
             raise HTTPException(409, 'Номер заявки вже використано для іншого звернення')
 
         return {
@@ -359,54 +366,21 @@ def create_app(settings=None):
 
     @app.patch('/admin/leads/{request_id}', dependencies=[Depends(admin_auth)])
     async def update_lead_state(request_id: UUID, body: LeadState):
-        if not store.set_state(str(request_id), body.state): 
+        if not store.set_state(str(request_id), body.state):
             raise HTTPException(404, 'Заявку не знайдено')
         return {'status': 'updated'}
 
-    @app.post('/api/chat')
-    async def chat_endpoint(body: ChatRequest, request: Request):
-        uid = validate(body.session_id)
-        limit(request, 'chat', uid)
-        message = body.message.strip()
-        if not message: 
-            raise HTTPException(422, 'Напишіть питання')
-        
-        lock = turn_locks.setdefault(uid, asyncio.Lock())
-        async with lock:
-            history = store.history(uid)
-        
-        clean_msg = redact(message)
-        
-        try:
-            async with asyncio.timeout(28.0):
-                # Передаємо також сирий message (raw_message) та uid для авто-заявки по телефону
-                answer = await assistant.answer(clean_msg, history, raw_message=message, session_uid=uid)
-        except asyncio.TimeoutError:
-            log.warning(f"FastAPI chat endpoint timeout for user {uid}")
-            answer = {'reply': 'Запит надто складний, і я не встиг його обробити. Уточніть питання або зверніться до менеджера.', 'products': [], 'handoff': True}
-        
-        async with lock:
-            current_history = store.history(uid)
-            store.save_history(uid, current_history + [
-                {'role': 'user', 'text': clean_msg},
-                {
-                    'role': 'assistant',
-                    'text': redact(answer['reply']),
-                    'product_ids': [p['id'] for p in answer.get('products', [])],
-                    'handoff': answer.get('handoff', False)
-                }
-            ])
-        return answer
+    return app
+
 
 async def send_telegram(settings, lead_obj):
     data = lead_obj['payload']
     product = data.get('product')
-    page_url = data.get('page_url') # ДОДАНО
-    
-    lead_id_safe = html.escape(str(lead_obj['id']))
+    page_url = data.get('page_url')
+
     name_safe = html.escape(data.get('name') or 'Не вказано')
     phone_safe = html.escape(str(data.get('phone', '')))
-    
+
     lines = [
         '⚡ <b>ЗАЯВКА З ЧАТУ ABV ХІМІЯ</b>',
         f"<b>Ім’я:</b> {name_safe}",
@@ -416,13 +390,13 @@ async def send_telegram(settings, lead_obj):
         p_name = html.escape(str(product.get('name', '')))
         p_sku = html.escape(str(product.get('vendor_code', product.get('id', ''))))
         lines.append(f"<b>Товар:</b> {p_name} (Арт: {p_sku})")
-        
+
     if page_url:
         lines.append(f"<b>Сторінка сайту:</b> <a href=\"{html.escape(page_url)}\">Перейти</a>")
-        
+
     if data.get('note'):
         lines.append(f"<b>Коментар:</b> {html.escape(str(data['note']))}")
-    
+
     if data.get('context'):
         ctx_lines = []
         for h in data['context'][-4:]:
@@ -448,5 +422,6 @@ async def send_telegram(settings, lead_obj):
     except Exception as e:
         log.warning(f"Telegram notification send error: {e}")
         return False, f'Telegram error: {e}'
+
 
 app = create_app()
