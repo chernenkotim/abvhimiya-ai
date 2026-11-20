@@ -363,13 +363,40 @@ def create_app(settings=None):
             raise HTTPException(404, 'Заявку не знайдено')
         return {'status': 'updated'}
 
-    @app.post('/admin/refresh-catalog', dependencies=[Depends(admin_auth)])
-    async def refresh_catalog():
-        if not await catalog.refresh(): 
-            raise HTTPException(503, 'Не вдалося оновити каталог; збережено попередній знімок')
-        return {'count': len(catalog.products)}
-
-    return app
+    @app.post('/api/chat')
+    async def chat_endpoint(body: ChatRequest, request: Request):
+        uid = validate(body.session_id)
+        limit(request, 'chat', uid)
+        message = body.message.strip()
+        if not message: 
+            raise HTTPException(422, 'Напишіть питання')
+        
+        lock = turn_locks.setdefault(uid, asyncio.Lock())
+        async with lock:
+            history = store.history(uid)
+        
+        clean_msg = redact(message)
+        
+        try:
+            async with asyncio.timeout(28.0):
+                # Передаємо також сирий message (raw_message) та uid для авто-заявки по телефону
+                answer = await assistant.answer(clean_msg, history, raw_message=message, session_uid=uid)
+        except asyncio.TimeoutError:
+            log.warning(f"FastAPI chat endpoint timeout for user {uid}")
+            answer = {'reply': 'Запит надто складний, і я не встиг його обробити. Уточніть питання або зверніться до менеджера.', 'products': [], 'handoff': True}
+        
+        async with lock:
+            current_history = store.history(uid)
+            store.save_history(uid, current_history + [
+                {'role': 'user', 'text': clean_msg},
+                {
+                    'role': 'assistant',
+                    'text': redact(answer['reply']),
+                    'product_ids': [p['id'] for p in answer.get('products', [])],
+                    'handoff': answer.get('handoff', False)
+                }
+            ])
+        return answer
 
 async def send_telegram(settings, lead_obj):
     data = lead_obj['payload']
