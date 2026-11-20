@@ -1,13 +1,15 @@
 """Grounded consultation with contextual retrieval, SKU resolution, and SalesDrive order lookup."""
 import asyncio
+import hashlib
 import json
 import logging
 import re
 import time
+import uuid
 import httpx
 
 from catalog import tokens
-from privacy import redact
+from privacy import normalize_phone, redact
 
 log = logging.getLogger(__name__)
 
@@ -80,19 +82,19 @@ def safe_public_product(p) -> dict:
     }
 
 async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dict:
-    if not domain or not api_key: 
+    if not domain or not api_key:
         return {"found": False}
     clean_digits = re.sub(r'\D', '', target)
     query_str = clean_digits if clean_digits else target.strip()
-    if not query_str: 
+    if not query_str:
         return {"found": False}
 
     clean_domain = domain if domain.endswith('.salesdrive.me') else f"{domain}.salesdrive.me"
     base_url = f"https://{clean_domain}/api/order/list/"
-    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/4.0"}
+    headers = {"X-Api-Key": api_key, "Accept": "application/json", "User-Agent": "ABV-AI-Assistant/4.1"}
 
     is_order_search = len(clean_digits) <= 8 and not clean_digits.startswith(('0', '380'))
-    
+
     if is_order_search:
         urls_to_try = [
             f"{base_url}?filter[externalId]={query_str}",
@@ -116,7 +118,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     if not orders:
                         continue
 
-                    # 1. Будуємо словник статусів з meta-даних CRM (щоб знати точні назви ваших статусів)
+                    # 1. Будуємо словник статусів з meta-даних CRM
                     status_map = {}
                     meta = data.get("meta") or {}
                     fields_meta = meta.get("fields") or {}
@@ -146,8 +148,8 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                     st_name = ""
                     raw_st_id = m.get("statusId")
                     if raw_st_id is not None:
-                        st_name = status_map.get(str(raw_st_id)) or SALESDRIVE_STATUSES.get(int(raw_st_id), "") if str(raw_st_id).isdigit() else str(raw_st_id)
-                    
+                        st_name = status_map.get(str(raw_st_id)) or (SALESDRIVE_STATUSES.get(int(raw_st_id), "") if str(raw_st_id).isdigit() else str(raw_st_id))
+
                     if not st_name:
                         st = m.get("status")
                         if isinstance(st, dict):
@@ -157,7 +159,7 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         elif isinstance(st, str) and st.strip():
                             st_name = status_map.get(st.strip()) or st.strip()
 
-                    # 3. Шукаємо статус Нової Пошти ("В дорозі", "Прибув у відділення" тощо) у вкладених блоках доставки
+                    # 3. Шукаємо статус Нової Пошти у вкладених блоках доставки
                     np_status = ""
                     np_blocks = m.get("ord_novaposhta") or m.get("ord_delivery_data") or []
                     if isinstance(np_blocks, dict):
@@ -178,7 +180,6 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         delivery_st = m.get("deliveryStatus") or m.get("tracking_status") or ""
                         np_status = delivery_st.get("text", "") if isinstance(delivery_st, dict) else str(delivery_st)
 
-                    # Якщо статусу замовлення немає, але є ТТН — ставимо "Відправлено" замість "В обробці"
                     dump = json.dumps(m, ensure_ascii=False)
                     ttn_match = re.search(r'\b(204\d{11}|59\d{12}|1\d{13}|205\d{11})\b', dump)
                     ttn = ttn_match.group(1) if ttn_match else ""
@@ -190,9 +191,9 @@ async def fetch_salesdrive_status(domain: str, api_key: str, target: str) -> dic
                         st_name = f"{st_name} — НП: {str(np_status).strip()}"
 
                     return {
-                        "found": True, 
-                        "order_id": ext_id, 
-                        "status": st_name, 
+                        "found": True,
+                        "order_id": ext_id,
+                        "status": st_name,
                         "ttn": ttn
                     }
     except Exception as e:
@@ -220,9 +221,68 @@ class Assistant:
         if isinstance(prods, list): return prods
         return []
 
-    async def answer(self, message, history):
+    async def answer(self, message, history, raw_message=None, session_uid=None):
         try:
+            orig_text = str(raw_message or message or '').strip()
             q = str(message or '').casefold().strip()
+
+            # 0. ПЕРЕХОПЛЕННЯ НОМЕРА ТЕЛЕФОНУ В ЧАТІ -> АВТО-ЗАЯВКА В TELEGRAM + ПЕРЕВІРКА CRM
+            phone_match = re.search(r'(?:\+?38[\s\-\(\)]*)?(0\d{2}[\s\-\(\)]*\d{3}[\s\-\(\)]*\d{2}[\s\-\(\)]*\d{2})', orig_text)
+            if phone_match:
+                raw_phone = phone_match.group(0)
+                try:
+                    norm_phone = normalize_phone(raw_phone)
+                except Exception:
+                    digits = re.sub(r'\D', '', raw_phone)
+                    norm_phone = f"+38{digits[-10:]}" if len(digits) >= 10 else raw_phone
+
+                if session_uid and hasattr(self.store, 'create_lead'):
+                    try:
+                        req_id = str(uuid.uuid4())
+                        note_text = "Клієнт залишив номер телефону в діалозі чату (запит на дзвінок / перевірку замовлення)."
+                        if orig_text != raw_phone:
+                            note_text += f" Повідомлення: {redact(orig_text)}"
+
+                        submitted = {
+                            'name': 'Клієнт з чату',
+                            'phone': norm_phone,
+                            'note': note_text,
+                            'product_id': None,
+                            'page_url': None
+                        }
+                        fp = hashlib.sha256(json.dumps(submitted, sort_keys=True, ensure_ascii=False).encode()).hexdigest()
+                        payload = submitted | {
+                            'product': None,
+                            'context': (history or [])[-6:] + [{'role': 'user', 'text': redact(orig_text)}],
+                            'consent_version': getattr(self.settings, 'consent_version', '1.0'),
+                            'consent_at': time.time(),
+                            'demo': getattr(self.settings, 'demo', False)
+                        }
+                        self.store.create_lead(req_id, session_uid, fp, payload)
+                    except Exception as lead_err:
+                        log.warning(f"Auto-lead from phone failed: {lead_err}")
+
+                info = await fetch_salesdrive_status(
+                    self.settings.salesdrive_domain,
+                    self.settings.salesdrive_key,
+                    norm_phone
+                )
+                if info.get("found"):
+                    ttn_text = f"\n📦 ТТН Нової Пошти: {info['ttn']}" if info.get('ttn') else ""
+                    return {
+                        'reply': (
+                            f"Дякую! Я передав ваш номер менеджеру для зв'язку, а також перевірив базу:\n\n"
+                            f"Замовлення №{info['order_id']}:\n• Статус: {info['status']}{ttn_text}"
+                        ),
+                        'products': [],
+                        'handoff': False
+                    }
+
+                return {
+                    'reply': "Дякую! Ваш номер телефону передано менеджеру. Найближчим часом ми зателефонуємо вам або напишемо у месенджер!",
+                    'products': [],
+                    'handoff': False
+                }
 
             if q in self.cache:
                 c_reply, c_ids = self.cache[q]
@@ -237,26 +297,22 @@ class Assistant:
                 r'(?:номер\s+)?(?:замовленн\w*|заявк\w*|посилк\w*|чек\w*|№|#)\s*[:№#\s]*([1-9]\d{3,7})\b',
                 r'\b([1-9]\d{3,7})\b'
             ]
-            
+
             search_id = None
             is_order_intent = bool(re.search(r'замовленн|заявк|статус|ттн|де посилка|де моє', q))
-            
-            phone_match = re.search(r'(?:\+?38)?0\d{9}', q)
-            if phone_match and is_order_intent:
-                search_id = phone_match.group(0)
-            else:
-                for pattern in order_patterns:
-                    m = re.search(pattern, q, re.IGNORECASE)
-                    if m:
-                        if pattern == r'\b([1-9]\d{3,7})\b' and not is_order_intent and len(q.split()) > 2:
-                            continue
-                        search_id = m.group(1)
-                        break
+
+            for pattern in order_patterns:
+                m = re.search(pattern, q, re.IGNORECASE)
+                if m:
+                    if pattern == r'\b([1-9]\d{3,7})\b' and not is_order_intent and len(q.split()) > 2:
+                        continue
+                    search_id = m.group(1)
+                    break
 
             if search_id:
                 info = await fetch_salesdrive_status(
-                    self.settings.salesdrive_domain, 
-                    self.settings.salesdrive_key, 
+                    self.settings.salesdrive_domain,
+                    self.settings.salesdrive_key,
                     search_id
                 )
                 if info.get("found"):
@@ -289,7 +345,7 @@ class Assistant:
 
             if 'нефрас' in q and ('уайт' in q or 'вайт' in q):
                 return {'reply': EXPERT_KNOWLEDGE["нефрас_уайт"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
-            
+
             if 'pla' in q and 'petg' in q:
                 return {'reply': EXPERT_KNOWLEDGE["pla_petg"], 'products': [safe_public_product(p) for p in items[:4]], 'handoff': False}
 
@@ -324,7 +380,7 @@ class Assistant:
                     ai_reply, ids, ai_handoff = result
                     matched = [p for p in items if str(getattr(p, 'id', '')).strip() in ids]
                     final_products = matched if matched else items[:4]
-                    
+
                     if not ai_handoff:
                         self.cache[q] = (ai_reply, [str(getattr(p, 'id', '')) for p in final_products])
 
@@ -361,7 +417,6 @@ class Assistant:
 
         model_name = (getattr(self.settings, 'gemini_model', '') or 'gemini-3.8-flash').strip().replace('models/', '')
 
-        # ПРИБРАНО responseMimeType: 'application/json' — саме цей параметр викликав зависання запитів на стороні Google
         body = {
             'systemInstruction': {'parts': [{'text': SYSTEM}]},
             'contents': [{'role': 'user', 'parts': [{'text': json.dumps(payload, ensure_ascii=False)}]}],
@@ -387,17 +442,17 @@ class Assistant:
                         headers={'x-goog-api-key': self.settings.gemini_key},
                         json=body
                     )
-                    
+
                     if response.status_code in (503, 429):
                         log.warning(f"Google API overload ({response.status_code}) on {model_name} (attempt {attempt + 1}/2).")
                         if attempt == 0 and time.monotonic() + 1.5 < deadline:
                             await asyncio.sleep(1.0)
                             continue
                         break
-                            
+
                     if response.status_code != 200:
                         log.warning(f"Gemini API [{model_name}] HTTP {response.status_code}: {response.text[:150]}")
-                        break 
+                        break
 
                     data = response.json()
                     candidates = data.get('candidates', [])
@@ -411,7 +466,7 @@ class Assistant:
                         break
 
                     raw_text = re.sub(r'^```(?:json)?\s*|\s*```$', '', raw_text)
-                    
+
                     try:
                         result = json.loads(raw_text, strict=False)
                         text_reply = str(result.get('text', '')).strip()
